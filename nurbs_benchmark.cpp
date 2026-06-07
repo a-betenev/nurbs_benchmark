@@ -45,6 +45,7 @@ void printUsage(const char* progName)
   std::cout << "  <indices>     - Comma-separated list of edge (for curves) or face (for surfaces) indices (1-based),\n";
   std::cout << "                  can include ranges like 3-7\n";
   std::cout << "  <numPoints>   - Number of points to evaluate\n";
+  std::cout << "  <numRepeats>  - Number of times to repeat evaluation (for grater times)\n";
   std::cout << "  <random|sequential> - Parameter distribution mode\n";
   std::cout << "  <derivDegree> - Derivative degree (0, 1, or 2)\n";
   std::cout << "  <perf|record> - Output mode: performance measurement or result recording\n";
@@ -144,12 +145,14 @@ static std::vector<std::pair<double, double>> generateRandomUVParams(int n, doub
  * Returns pair<wall_time_seconds, cpu_time_seconds>
  */
 template <typename Func>
-auto measureTime(Func&& func)
+auto measureTime(Func&& func, int numRepeats)
 {
   auto start_cpu = std::clock();
   auto start_wall = std::chrono::high_resolution_clock::now();
 
-  func();
+  for (int i = 0; i < numRepeats; i++) {
+    func();
+  }
 
   auto end_wall = std::chrono::high_resolution_clock::now();
   auto end_cpu = std::clock();
@@ -514,6 +517,7 @@ void dumpSurfaceResults(const std::vector<BRepAdaptor_Surface>& surfaces,
 void benchmarkCurves(const TopoDS_Shape& shape,
                      const std::vector<int>& edgeIndices,
                      int numPoints,
+                     int numRepeats,
                      bool randomMode,
                      int derivDegree,
                      bool recordOutput)
@@ -563,13 +567,13 @@ void benchmarkCurves(const TopoDS_Shape& shape,
   std::pair<double, double> times = {};
   switch (derivDegree) {
   case 0:
-    times = measureTime([&]() {evaluateCurvesDegree0(curves, allParams, allPoints); });
+    times = measureTime([&]() {evaluateCurvesDegree0(curves, allParams, allPoints); }, numRepeats);
     break;
   case 1:
-    times = measureTime([&]() {evaluateCurvesDegree1(curves, allParams, allPoints); });
+    times = measureTime([&]() {evaluateCurvesDegree1(curves, allParams, allPoints); }, numRepeats);
     break;
   case 2:
-    times = measureTime([&]() {evaluateCurvesDegree2(curves, allParams, allPoints); });
+    times = measureTime([&]() {evaluateCurvesDegree2(curves, allParams, allPoints); }, numRepeats);
     break;
   }
   double total_wall = times.first;
@@ -579,12 +583,13 @@ void benchmarkCurves(const TopoDS_Shape& shape,
   dumpCurveResults(curves, allParams, allPoints, recordOutput ? derivDegree : -1);
 
   // Output performance summary to stderr (so it doesn't interfere with record output)
+  size_t nbPointsTotal = curves.size() * numPoints * numRepeats;
   std::cerr << "\n=== Performance Summary ===\n";
   std::cerr << "Total wall clock time: " << total_wall << " seconds\n";
   std::cerr << "Total CPU time:         " << total_cpu << " seconds\n";
-  std::cerr << "Points evaluated:       " << (curves.size() * numPoints) << "\n";
+  std::cerr << "Points evaluated:       " << nbPointsTotal << "\n";
   if (total_wall > 0) {
-    std::cerr << "Evaluations per second: " << (curves.size() * numPoints / total_wall) << "\n";
+    std::cerr << "Evaluations per second: " << (size_t)(nbPointsTotal / total_wall) << "\n";
   }
 }
 
@@ -594,6 +599,7 @@ void benchmarkCurves(const TopoDS_Shape& shape,
 void benchmarkSurfaces(const TopoDS_Shape& shape,
                        const std::vector<int>& faceIndices,
                        int numPoints,
+                       int numRepeats,
                        bool randomMode,
                        int derivDegree,
                        bool recordOutput)
@@ -645,13 +651,13 @@ void benchmarkSurfaces(const TopoDS_Shape& shape,
   std::pair<double, double> times = {};
   switch (derivDegree) {
   case 0:
-    times = measureTime([&]() {evaluateSurfacesDegree0(surfaces, allUVPoints, allPoints); });
+    times = measureTime([&]() {evaluateSurfacesDegree0(surfaces, allUVPoints, allPoints); }, numRepeats);
     break;
   case 1:
-    times = measureTime([&]() {evaluateSurfacesDegree1(surfaces, allUVPoints, allPoints); });
+    times = measureTime([&]() {evaluateSurfacesDegree1(surfaces, allUVPoints, allPoints); }, numRepeats);
     break;
   case 2:
-    times = measureTime([&]() {evaluateSurfacesDegree2(surfaces, allUVPoints, allPoints); });
+    times = measureTime([&]() {evaluateSurfacesDegree2(surfaces, allUVPoints, allPoints); }, numRepeats);
     break;
   }
   double total_wall = times.first;
@@ -661,12 +667,13 @@ void benchmarkSurfaces(const TopoDS_Shape& shape,
   dumpSurfaceResults(surfaces, allUVPoints, allPoints, recordOutput ? derivDegree : -1);
 
   // Output performance summary to stderr (so it doesn't interfere with record output)
+  size_t nbPointsTotal = surfaces.size() * numPoints * numRepeats;
   std::cerr << "\n=== Performance Summary ===\n";
   std::cerr << "Total wall clock time: " << total_wall << " seconds\n";
   std::cerr << "Total CPU time:         " << total_cpu << " seconds\n";
-  std::cerr << "Points evaluated:       " << (surfaces.size() * numPoints) << "\n";
+  std::cerr << "Points evaluated:       " << nbPointsTotal << "\n";
   if (total_wall > 0) {
-    std::cerr << "Evaluations per second: " << (surfaces.size() * numPoints / total_wall) << "\n";
+    std::cerr << "Evaluations per second: " << (size_t)(nbPointsTotal / total_wall) << "\n";
   }
 }
 
@@ -676,7 +683,7 @@ void benchmarkSurfaces(const TopoDS_Shape& shape,
 int main(int argc, char* argv[])
 {
   // Parse command line arguments
-  if (argc != 8) {
+  if (argc != 9) {
     printUsage(argv[0]);
     return 1;
   }
@@ -686,9 +693,10 @@ int main(int argc, char* argv[])
     std::string typeStr = argv[2];
     std::string indicesStr = argv[3];
     int numPoints = std::stoi(argv[4]);
-    std::string modeStr = argv[5];
-    int derivDegree = std::stoi(argv[6]);
-    std::string outputStr = argv[7];
+    int numRepeats = std::stoi(argv[5]);
+    std::string modeStr = argv[6];
+    int derivDegree = std::stoi(argv[7]);
+    std::string outputStr = argv[8];
 
     // Validate arguments
     if (numPoints <= 0) {
@@ -751,7 +759,7 @@ int main(int argc, char* argv[])
         std::cerr << indices[i];
       }
       std::cerr << ")" << std::endl << std::endl;
-      benchmarkCurves(shape, indices, numPoints, isRandom, derivDegree, recordOutput);
+      benchmarkCurves(shape, indices, numPoints, numRepeats, isRandom, derivDegree, recordOutput);
     }
     else {
       std::cerr << "Benchmarking surfaces (faces: ";
@@ -760,7 +768,7 @@ int main(int argc, char* argv[])
         std::cerr << indices[i];
       }
       std::cerr << ")" << std::endl << std::endl;
-      benchmarkSurfaces(shape, indices, numPoints, isRandom, derivDegree, recordOutput);
+      benchmarkSurfaces(shape, indices, numPoints, numRepeats, isRandom, derivDegree, recordOutput);
     }
 
   }
