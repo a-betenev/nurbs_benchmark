@@ -39,7 +39,7 @@
   */
 void printUsage(const char* progName)
 {
-  std::cout << "Usage: " << progName << " <file> <curves|surfaces> <indices> <numPoints> <random|sequential> <derivDegree(0-2)> <perf|record>\n";
+  std::cout << "Usage: " << progName << " <file> <curves|surfaces> <indices> <numPoints> <numRepeats> <random|sequential> <derivDegree(0-2)> <perf|record>\n";
   std::cout << "  <file>        - Path to .brep or .step file\n";
   std::cout << "  <curves|surfaces> - Choose to evaluate curves or surfaces\n";
   std::cout << "  <indices>     - Comma-separated list of edge (for curves) or face (for surfaces) indices (1-based),\n";
