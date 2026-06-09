@@ -45,11 +45,11 @@ void printUsage(const char* progName)
   std::cout << "  <indices>     - Comma-separated list of edge (for curves) or face (for surfaces) indices (1-based),\n";
   std::cout << "                  can include ranges like 3-7\n";
   std::cout << "  <numPoints>   - Number of points to evaluate\n";
-  std::cout << "  <numRepeats>  - Number of times to repeat evaluation (for grater times)\n";
+  std::cout << "  <numRepeats>  - Number of times to repeat evaluation (for greater times)\n";
   std::cout << "  <random|sequential> - Parameter distribution mode\n";
   std::cout << "  <derivDegree> - Derivative degree (0, 1, or 2)\n";
   std::cout << "  <perf|record> - Output mode: performance measurement or result recording\n";
-  std::cout << "\nExample: " << progName << " model.step curves 1,2,3 10000 random 1 perf\n";
+  std::cout << "\nExample: " << progName << " model.step curves 1,2,3 10000 10 random 1 perf\n";
 }
 
 /**
@@ -512,15 +512,25 @@ void dumpSurfaceResults(const std::vector<BRepAdaptor_Surface>& surfaces,
 }
 
 /**
+ * Performance measurement results
+ */
+struct PerfResult
+{
+  size_t nbPoints = 0;
+  double elapsedTime = 0;
+  double cpuTime = 0;
+};
+
+/**
  * Benchmark NURBS curves
  */
-void benchmarkCurves(const TopoDS_Shape& shape,
-                     const std::vector<int>& edgeIndices,
-                     int numPoints,
-                     int numRepeats,
-                     bool randomMode,
-                     int derivDegree,
-                     bool recordOutput)
+PerfResult benchmarkCurves(const TopoDS_Shape& shape,
+                           const std::vector<int>& edgeIndices,
+                           int numPoints,
+                           int numRepeats,
+                           bool randomMode,
+                           int derivDegree,
+                           bool recordOutput)
 {
   // Collect all edges from the shape
   std::vector<TopoDS_Edge> edges;
@@ -582,27 +592,20 @@ void benchmarkCurves(const TopoDS_Shape& shape,
   // Output either summary of curve propeties or all points evaluated
   dumpCurveResults(curves, allParams, allPoints, recordOutput ? derivDegree : -1);
 
-  // Output performance summary to stderr (so it doesn't interfere with record output)
-  size_t nbPointsTotal = curves.size() * numPoints * numRepeats;
-  std::cerr << "\n=== Performance Summary ===\n";
-  std::cerr << "Total wall clock time: " << total_wall << " seconds\n";
-  std::cerr << "Total CPU time:         " << total_cpu << " seconds\n";
-  std::cerr << "Points evaluated:       " << nbPointsTotal << "\n";
-  if (total_wall > 0) {
-    std::cerr << "Evaluations per second: " << (size_t)(nbPointsTotal / total_wall) << "\n";
-  }
+  // Return performance counters
+  return { curves.size() * numPoints * numRepeats, times.first, times.second };
 }
 
 /**
  * Benchmark NURBS surfaces
  */
-void benchmarkSurfaces(const TopoDS_Shape& shape,
-                       const std::vector<int>& faceIndices,
-                       int numPoints,
-                       int numRepeats,
-                       bool randomMode,
-                       int derivDegree,
-                       bool recordOutput)
+PerfResult benchmarkSurfaces(const TopoDS_Shape& shape,
+                             const std::vector<int>& faceIndices,
+                             int numPoints,
+                             int numRepeats,
+                             bool randomMode,
+                             int derivDegree,
+                             bool recordOutput)
 {
   // Collect all faces from the shape
   std::vector<TopoDS_Face> faces;
@@ -666,15 +669,8 @@ void benchmarkSurfaces(const TopoDS_Shape& shape,
   // Output either summary of surface propeties or all points evaluated
   dumpSurfaceResults(surfaces, allUVPoints, allPoints, recordOutput ? derivDegree : -1);
 
-  // Output performance summary to stderr (so it doesn't interfere with record output)
-  size_t nbPointsTotal = surfaces.size() * numPoints * numRepeats;
-  std::cerr << "\n=== Performance Summary ===\n";
-  std::cerr << "Total wall clock time: " << total_wall << " seconds\n";
-  std::cerr << "Total CPU time:         " << total_cpu << " seconds\n";
-  std::cerr << "Points evaluated:       " << nbPointsTotal << "\n";
-  if (total_wall > 0) {
-    std::cerr << "Evaluations per second: " << (size_t)(nbPointsTotal / total_wall) << "\n";
-  }
+  // Return performance counters
+  return { surfaces.size() * numPoints * numRepeats, times.first, times.second };
 }
 
 /**
@@ -787,30 +783,45 @@ int main(int argc, char* argv[])
     }
 
     // Load shape
-    std::cerr << "Loading shape from: " << filePath << std::endl;
+    std::cout << "Loading shape from: " << filePath << std::endl;
     TopoDS_Shape shape = loadShape(filePath);
-    std::cerr << "Shape loaded successfully" << std::endl;
+    std::cout << "Shape loaded successfully" << std::endl;
 
     // Run benchmark
+    PerfResult result;
     if (isCurves) {
-      std::cerr << "Benchmarking curves (edges: ";
+      std::cout << "Benchmarking curves (edges: ";
       for (size_t i = 0; i < indices.size(); ++i) {
-        if (i > 0) std::cerr << ",";
-        std::cerr << indices[i];
+        if (i > 0) std::cout << ",";
+        std::cout << indices[i];
       }
-      std::cerr << ")" << std::endl << std::endl;
-      benchmarkCurves(shape, indices, numPoints, numRepeats, isRandom, derivDegree, recordOutput);
+      std::cout << ")" << std::endl << std::endl;
+      result = benchmarkCurves(shape, indices, numPoints, numRepeats, isRandom, derivDegree, recordOutput);
     }
     else {
-      std::cerr << "Benchmarking surfaces (faces: ";
+      std::cout << "Benchmarking surfaces (faces: ";
       for (size_t i = 0; i < indices.size(); ++i) {
-        if (i > 0) std::cerr << ",";
-        std::cerr << indices[i];
+        if (i > 0) std::cout << ",";
+        std::cout << indices[i];
       }
-      std::cerr << ")" << std::endl << std::endl;
-      benchmarkSurfaces(shape, indices, numPoints, numRepeats, isRandom, derivDegree, recordOutput);
+      std::cout << ")" << std::endl << std::endl;
+      result = benchmarkSurfaces(shape, indices, numPoints, numRepeats, isRandom, derivDegree, recordOutput);
     }
 
+    // Output performance summary
+    std::cout << "\n=== Performance Summary ===\n";
+    std::cout << "Total wall clock time: " << result.elapsedTime << " seconds\n";
+    std::cout << "Total CPU time:         " << result.cpuTime << " seconds\n";
+    std::cout << "Points evaluated:       " << result.nbPoints << "\n";
+    if (result.elapsedTime > 0) {
+      std::cout << "Evaluations per second: " << (size_t)(result.nbPoints / result.elapsedTime) << "\n";
+    }
+
+    // Output one-line information on a call and results to cerr for statistics
+    for (int i = 0; i < argc; i++) {
+      std::cerr << argv[i] << " ";
+    }
+    std::cerr << "NbPoints " << result.nbPoints << " Elapsed " << result.elapsedTime << " CPU " << result.cpuTime << std::endl;
   }
   catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << std::endl;
