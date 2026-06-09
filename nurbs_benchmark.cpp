@@ -678,6 +678,44 @@ void benchmarkSurfaces(const TopoDS_Shape& shape,
 }
 
 /**
+ * Tune system to get more stable measurements
+ */
+void StabilizeForMinMeasurement()
+{
+  // 1. Force CPU to maximum frequency (prevents throttling giving false lows)
+  // Run a busy loop first to exit low-power states
+  auto start = std::chrono::steady_clock::now();
+  while (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < 0.1) {
+    _mm_pause();
+  }
+
+
+#ifdef _WIN32
+
+  // 2. Align to core 0 for most consistent frequency scaling
+  SetThreadAffinityMask(GetCurrentThread(), 1);
+
+  // 3. Prevent Windows from moving our thread while measuring
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+  // 4. Disable Turbo Boost? (Optional - more consistent but slower)
+  // Use powercfg to set max frequency to 99% disabling turbo
+
+  // Disable Core Parking (run once before measurements)
+  system("powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"); // High performance
+
+  // Force Windows to complete background tasks
+  Sleep(1000);
+
+  // Clear working set to avoid page faults during measurement
+  SetProcessWorkingSetSize(GetCurrentProcess(), -1, -1);
+
+  // Disable Windows Update, Defender, etc. (manual steps recommended)
+
+#endif
+}
+
+/**
  * Main entry point
  */
 int main(int argc, char* argv[])
@@ -687,6 +725,8 @@ int main(int argc, char* argv[])
     printUsage(argv[0]);
     return 1;
   }
+
+  StabilizeForMinMeasurement();
 
   try {
     std::string filePath = argv[1];
