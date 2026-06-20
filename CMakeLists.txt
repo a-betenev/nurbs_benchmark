@@ -5,6 +5,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find OCCT
+find_package(fmt REQUIRED)
+find_package(Freetype REQUIRED)
+find_package(VTK CONFIG REQUIRED COMPONENTS CommonCore)
 find_package(OpenCASCADE REQUIRED)
 
 add_executable(nurbs_benchmark nurbs_benchmark.cpp)
