@@ -34,6 +34,10 @@
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
  /**
   * Print usage information
   */
@@ -698,7 +702,7 @@ void StabilizeForMinMeasurement()
   // Use powercfg to set max frequency to 99% disabling turbo
 
   // Disable Core Parking (run once before measurements)
-  system("powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"); // High performance
+//  system("powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"); // High performance
 
   // Force Windows to complete background tasks
   Sleep(1000);
