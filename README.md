@@ -35,3 +35,14 @@ Example:
     nurbs_benchmark.exe path_to_occt/data/occ/terrain.brep surfaces 1 1000000 500 sequential 1 perf 2>>runs.log
 
 Note that each run outputs one-line digest of the run containing program arguments and times to `cerr`, this can be used to collect a log of all runs for consequent analysis.
+
+Hints
+-----
+
+To have performance measurements stable, it is recommended to:
+
+* Run with affinity to one (performant) CPU core (done programmatically)
+* Set high priority to the process (done programmatically)
+* Set high performance profile (in OS settings)
+* Disable CPU Turbo Boost (e.g. use ThrottleStop utility by TechPowerUp, run it and check "Disable turbo")
+
