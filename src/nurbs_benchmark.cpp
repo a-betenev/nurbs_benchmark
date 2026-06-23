@@ -739,8 +739,8 @@ int main(int argc, char* argv[])
     std::string outputStr = argv[8];
 
     // Validate arguments
-    if (numPoints <= 0) {
-      throw std::runtime_error("Number of points must be positive");
+    if (numPoints < 0) {
+      throw std::runtime_error("Number of points must be non-negative");
     }
 
     if (derivDegree < 0 || derivDegree > 2) {
@@ -813,19 +813,22 @@ int main(int argc, char* argv[])
     }
 
     // Output performance summary
-    std::cout << "\n=== Performance Summary ===\n";
-    std::cout << "Total wall clock time: " << result.elapsedTime << " seconds\n";
-    std::cout << "Total CPU time:         " << result.cpuTime << " seconds\n";
-    std::cout << "Points evaluated:       " << result.nbPoints << "\n";
-    if (result.elapsedTime > 0) {
-      std::cout << "Evaluations per second: " << (size_t)(result.nbPoints / result.elapsedTime) << "\n";
-    }
+    if (numPoints > 0)
+    {
+      std::cout << "\n=== Performance Summary ===\n";
+      std::cout << "Total wall clock time: " << result.elapsedTime << " seconds\n";
+      std::cout << "Total CPU time:         " << result.cpuTime << " seconds\n";
+      std::cout << "Points evaluated:       " << result.nbPoints << "\n";
+      if (result.elapsedTime > 0) {
+        std::cout << "Evaluations per second: " << (size_t)(result.nbPoints / result.elapsedTime) << "\n";
+      }
 
-    // Output one-line information on a call and results to cerr for statistics
-    for (int i = 0; i < argc; i++) {
-      std::cerr << argv[i] << " ";
+      // Output one-line information on a call and results to cerr for statistics
+      for (int i = 0; i < argc; i++) {
+        std::cerr << argv[i] << " ";
+      }
+      std::cerr << "NbPoints " << result.nbPoints << " Elapsed " << result.elapsedTime << " CPU " << result.cpuTime << std::endl;
     }
-    std::cerr << "NbPoints " << result.nbPoints << " Elapsed " << result.elapsedTime << " CPU " << result.cpuTime << std::endl;
   }
   catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << std::endl;
