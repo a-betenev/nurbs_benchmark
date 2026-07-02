@@ -71,7 +71,11 @@ static std::mt19937 createRNG()
 static std::vector<double> generateSequentialParams(int n, double tmin, double tmax)
 {
   std::vector<double> params(n);
-  if (n <= 1) {
+  if (n <= 0) {
+    return params;
+  }
+
+  if (n == 1) {
     params[0] = (tmin + tmax) / 2.0;
   }
   else {
@@ -372,8 +376,9 @@ void dumpCurveResults(const std::vector<BRepAdaptor_Curve>& curves,
     for (double t : params) {
       std::cout << " t " << t;
 
-      const gp_Pnt& P = points[i].P;
-      const gp_Vec& D1 = points[i].D1, D2 = points[i].D2;
+      const CurveResult& result = points[i++];
+      const gp_Pnt& P = result.P;
+      const gp_Vec& D1 = result.D1, D2 = result.D2;
 
       std::cout << " P (" << P.X() << "," << P.Y() << "," << P.Z() << ")";
       if (derivDegree > 0)
@@ -495,9 +500,9 @@ void dumpSurfaceResults(const std::vector<BRepAdaptor_Surface>& surfaces,
       std::cout << " u " << u << " v " << v;
 
       const SurfaceResult& r = points[i++];
-      const gp_Pnt& P = points[i].P;
-      const gp_Vec& D1u = points[i].D1u, D1v = points[i].D1v;
-      const gp_Vec& D2uu = points[i].D2uu, D2vv = points[i].D2vv, D2uv = points[i].D2uv;
+      const gp_Pnt& P = r.P;
+      const gp_Vec& D1u = r.D1u, D1v = r.D1v;
+      const gp_Vec& D2uu = r.D2uu, D2vv = r.D2vv, D2uv = r.D2uv;
 
       std::cout << " P (" << P.X() << "," << P.Y() << "," << P.Z() << ")";
       if (derivDegree > 0) {
