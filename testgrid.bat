@@ -45,7 +45,7 @@ if "%mode%" == "test" (
           echo =====================================================
           echo Iteration %%~i, case %%~a, %%~o, degree %%~d
           echo =====================================================
-          %EXE% %DATA_DIR%/%%~a %%~o %%~d perf 2>>runs.log
+          start /AFFINITY 1 /B /HIGH %EXE% %DATA_DIR%/%%~a %%~o %%~d perf 2>>runs.log
         )
       )
     )

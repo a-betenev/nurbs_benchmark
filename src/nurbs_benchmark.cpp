@@ -36,6 +36,55 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <powerbase.h>
+#pragma comment(lib, "PowrProf.lib")
+
+ //! Query maximal processor frequency, 0. if failed
+static double GetCPUFrequency()
+{
+  // Note: this structure is missing in WinNT.h, so copied here according to MS recommendation
+  struct PROCESSOR_POWER_INFORMATION
+  {
+    ULONG Number;
+    ULONG MaxMhz;
+    ULONG CurrentMhz;
+    ULONG MhzLimit;
+    ULONG MaxIdleState;
+    ULONG CurrentIdleState;
+  };
+
+  SYSTEM_INFO aSysInfo;
+  GetSystemInfo(&aSysInfo);
+
+  std::vector<PROCESSOR_POWER_INFORMATION> aProcInfoVec(aSysInfo.dwNumberOfProcessors, PROCESSOR_POWER_INFORMATION{});
+  LONG status = CallNtPowerInformation(ProcessorInformation, NULL, 0, &aProcInfoVec[0],
+                                       aSysInfo.dwNumberOfProcessors * sizeof(PROCESSOR_POWER_INFORMATION));
+  if (status != 0)
+  {
+    std::cerr << "Warning: CallNtPowerInformation() failed with status = " << status << std::endl;
+    return 0.;
+  }
+  double aFrequency = 0.0;
+  for (const PROCESSOR_POWER_INFORMATION& aProcInfo : aProcInfoVec)
+  {
+    aFrequency = std::max(aFrequency, 1.e6 * aProcInfo.MaxMhz);
+  }
+  return aFrequency;
+}
+
+double GetProcessCPU()
+{
+  static const HANDLE hProcess = GetCurrentProcess();
+  static const double aFrequency = GetCPUFrequency();
+
+  ULONG64 cycleCount = 0;
+  if (aFrequency > 0. && QueryProcessCycleTime(hProcess, &cycleCount))
+  {
+    return cycleCount / aFrequency;
+  }
+  return 0.; // stub
+}
+
 #endif
 
  /**
@@ -145,18 +194,35 @@ static std::vector<std::pair<double, double>> generateRandomUVParams(int n, doub
 }
 
 /**
+ * Performance measurement results
+ */
+struct PerfResult
+{
+  size_t nbPoints = 0;
+  double elapsedTime = 0;
+  double cpuTime = 0;
+  double cpuTime2 = 0;
+  unsigned __int64 totalTsc = 0;
+};
+
+/**
  * Measure both wall clock time and CPU time of a function execution
  * Returns pair<wall_time_seconds, cpu_time_seconds>
  */
 template <typename Func>
-auto measureTime(Func&& func, int numRepeats)
+PerfResult measureTime(Func&& func, int numRepeats)
 {
   auto start_cpu = std::clock();
   auto start_wall = std::chrono::high_resolution_clock::now();
+  double start_cpu2 = GetProcessCPU();
+  unsigned __int64 start_tsc = __rdtsc();
 
   for (int i = 0; i < numRepeats; i++) {
     func();
   }
+
+  unsigned __int64 total_tsc = __rdtsc() - startTsc;
+  double total_cpu2 = GetProcessCPU();
 
   auto end_wall = std::chrono::high_resolution_clock::now();
   auto end_cpu = std::clock();
@@ -164,7 +230,7 @@ auto measureTime(Func&& func, int numRepeats)
   double wall_time = std::chrono::duration<double>(end_wall - start_wall).count();
   double cpu_time = static_cast<double>(end_cpu - start_cpu) / CLOCKS_PER_SEC;
 
-  return std::make_pair(wall_time, cpu_time);
+  return { 0, wall_time, cpu_time, total_cpu2, totalTsc };
 }
 
 /**
@@ -516,16 +582,6 @@ void dumpSurfaceResults(const std::vector<BRepAdaptor_Surface>& surfaces,
 }
 
 /**
- * Performance measurement results
- */
-struct PerfResult
-{
-  size_t nbPoints = 0;
-  double elapsedTime = 0;
-  double cpuTime = 0;
-};
-
-/**
  * Benchmark NURBS curves
  */
 PerfResult benchmarkCurves(const TopoDS_Shape& shape,
@@ -578,26 +634,25 @@ PerfResult benchmarkCurves(const TopoDS_Shape& shape,
   }
 
   // Select and execute the appropriate evaluation function based on mode and degree
-  std::pair<double, double> times = {};
+  PerfResult result{};
   switch (derivDegree) {
   case 0:
-    times = measureTime([&]() {evaluateCurvesDegree0(curves, allParams, allPoints); }, numRepeats);
+    result = measureTime([&]() {evaluateCurvesDegree0(curves, allParams, allPoints); }, numRepeats);
     break;
   case 1:
-    times = measureTime([&]() {evaluateCurvesDegree1(curves, allParams, allPoints); }, numRepeats);
+    result = measureTime([&]() {evaluateCurvesDegree1(curves, allParams, allPoints); }, numRepeats);
     break;
   case 2:
-    times = measureTime([&]() {evaluateCurvesDegree2(curves, allParams, allPoints); }, numRepeats);
+    result = measureTime([&]() {evaluateCurvesDegree2(curves, allParams, allPoints); }, numRepeats);
     break;
   }
-  double total_wall = times.first;
-  double total_cpu = times.second;
 
   // Output either summary of curve propeties or all points evaluated
   dumpCurveResults(curves, allParams, allPoints, recordOutput ? derivDegree : -1);
 
-  // Return performance counters
-  return { curves.size() * numPoints * numRepeats, times.first, times.second };
+  // Return counters
+  result.nbPoints = curves.size() * numPoints * numRepeats;
+  return result;
 }
 
 /**
@@ -655,26 +710,25 @@ PerfResult benchmarkSurfaces(const TopoDS_Shape& shape,
   }
 
   // Select and execute the appropriate evaluation function based on mode and degree
-  std::pair<double, double> times = {};
+  PerfResult result{};
   switch (derivDegree) {
   case 0:
-    times = measureTime([&]() {evaluateSurfacesDegree0(surfaces, allUVPoints, allPoints); }, numRepeats);
+    result = measureTime([&]() {evaluateSurfacesDegree0(surfaces, allUVPoints, allPoints); }, numRepeats);
     break;
   case 1:
-    times = measureTime([&]() {evaluateSurfacesDegree1(surfaces, allUVPoints, allPoints); }, numRepeats);
+    result = measureTime([&]() {evaluateSurfacesDegree1(surfaces, allUVPoints, allPoints); }, numRepeats);
     break;
   case 2:
-    times = measureTime([&]() {evaluateSurfacesDegree2(surfaces, allUVPoints, allPoints); }, numRepeats);
+    result = measureTime([&]() {evaluateSurfacesDegree2(surfaces, allUVPoints, allPoints); }, numRepeats);
     break;
   }
-  double total_wall = times.first;
-  double total_cpu = times.second;
 
   // Output either summary of surface propeties or all points evaluated
   dumpSurfaceResults(surfaces, allUVPoints, allPoints, recordOutput ? derivDegree : -1);
 
   // Return performance counters
-  return { surfaces.size() * numPoints * numRepeats, times.first, times.second };
+  result.nbPoints = surfaces.size() * numPoints * numRepeats;
+  return result;
 }
 
 /**
@@ -693,10 +747,10 @@ void StabilizeForMinMeasurement()
 #ifdef _WIN32
 
   // 2. Align to core 0 for most consistent frequency scaling
-  SetThreadAffinityMask(GetCurrentThread(), 1);
+//  SetThreadAffinityMask(GetCurrentThread(), 1);
 
   // 3. Prevent Windows from moving our thread while measuring
-  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+//  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
   // 4. Disable Turbo Boost? (Optional - more consistent but slower)
   // Use powercfg to set max frequency to 99% disabling turbo
@@ -786,6 +840,17 @@ int main(int argc, char* argv[])
       throw std::runtime_error("No indices provided");
     }
 
+    // Print timestamp
+    auto getTime = []() {
+      auto now = std::chrono::system_clock::now();
+      std::time_t time = std::chrono::system_clock::to_time_t(now);
+
+      std::stringstream ss;
+      ss << std::put_time(std::localtime(&time), "%FT%T");
+      return ss.str();
+    };
+    std::cout << getTime() << std::endl;
+
     // Load shape
     std::cout << "Loading shape from: " << filePath << std::endl;
     TopoDS_Shape shape = loadShape(filePath);
@@ -816,18 +881,24 @@ int main(int argc, char* argv[])
     if (numPoints > 0)
     {
       std::cout << "\n=== Performance Summary ===\n";
-      std::cout << "Total wall clock time: " << result.elapsedTime << " seconds\n";
+      std::cout << "Total wall clock time:  " << result.elapsedTime << " seconds\n";
       std::cout << "Total CPU time:         " << result.cpuTime << " seconds\n";
+      std::cout << "QueryProcessCycleTime:  " << result.cpuTime2 << " sec\n";
+      std::cout << "TSC:                    " << result.totalTsc / 1000000 << " M\n";
       std::cout << "Points evaluated:       " << result.nbPoints << "\n";
       if (result.elapsedTime > 0) {
         std::cout << "Evaluations per second: " << (size_t)(result.nbPoints / result.elapsedTime) << "\n";
       }
 
       // Output one-line information on a call and results to cerr for statistics
-      for (int i = 0; i < argc; i++) {
+      std::cerr << getTime() << " ";
+      for (int i = 1; i < argc; i++) {
         std::cerr << argv[i] << " ";
       }
-      std::cerr << "NbPoints " << result.nbPoints << " Elapsed " << result.elapsedTime << " CPU " << result.cpuTime << std::endl;
+      std::cerr << "NbPoints " << result.nbPoints 
+        << " Elapsed " << result.elapsedTime << " CPU " << result.cpuTime
+        << " QueryProcessCycleTime " << result.cpuTime2 << " TSC " << result.totalTsc / 1000000
+        << std::endl;
     }
   }
   catch (const std::exception& e) {
