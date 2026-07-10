@@ -221,7 +221,7 @@ PerfResult measureTime(Func&& func, int numRepeats)
     func();
   }
 
-  unsigned __int64 total_tsc = __rdtsc() - startTsc;
+  unsigned __int64 total_tsc = __rdtsc() - start_tsc;
   double total_cpu2 = GetProcessCPU();
 
   auto end_wall = std::chrono::high_resolution_clock::now();
@@ -230,7 +230,7 @@ PerfResult measureTime(Func&& func, int numRepeats)
   double wall_time = std::chrono::duration<double>(end_wall - start_wall).count();
   double cpu_time = static_cast<double>(end_cpu - start_cpu) / CLOCKS_PER_SEC;
 
-  return { 0, wall_time, cpu_time, total_cpu2, totalTsc };
+  return { 0, wall_time, cpu_time, total_cpu2, total_tsc };
 }
 
 /**
@@ -656,6 +656,31 @@ PerfResult benchmarkCurves(const TopoDS_Shape& shape,
 }
 
 /**
+ * Check distance between corner point of the BSpline surface and corresponding pole,
+ * in the case if both U and V multiplicities at that corner are equal to degree + 1.
+ * This allows to check accuracy of evaluation against ground truth.
+ */
+void checkCorner(const BRepAdaptor_Surface& surf, bool takeMinU, bool takeMinV)
+{
+  Handle(Geom_BSplineSurface) bspl = surf.BSpline();
+  if (!bspl)
+  {
+    return;
+  }
+  if (bspl->UMultiplicity(takeMinU ? 1 : bspl->NbUKnots()) != bspl->UDegree() + 1||
+      bspl->VMultiplicity(takeMinV ? 1 : bspl->NbVKnots()) != bspl->VDegree() + 1)
+  {
+    return;
+  }
+  gp_Pnt pole = bspl->Pole(takeMinU ? 1 : bspl->NbUPoles(), takeMinV ? 1 : bspl->NbVPoles());
+  gp_Pnt corner = surf.Value(bspl->UKnot(takeMinU ? 1 : bspl->NbUKnots()),
+                             bspl->VKnot(takeMinV ? 1 : bspl->NbVKnots()));
+  Standard_Real dist = pole.Distance(corner);
+  std::cout << "Corner [" << (takeMinU ? 0 : 1) << ", " << (takeMinV ? 0 : 1) <<
+    "] distance to pole = " << dist << std::endl;
+}
+
+/**
  * Benchmark NURBS surfaces
  */
 PerfResult benchmarkSurfaces(const TopoDS_Shape& shape,
@@ -707,6 +732,12 @@ PerfResult benchmarkSurfaces(const TopoDS_Shape& shape,
     }
 
     allPoints.emplace_back(allUVPoints.back().size());
+
+    // Check evaluation of points at corners of the surface (only for clamped BSplines)
+    checkCorner(surf, false, false);
+    checkCorner(surf, false, true);
+    checkCorner(surf, true, false);
+    checkCorner(surf, true, true);
   }
 
   // Select and execute the appropriate evaluation function based on mode and degree
