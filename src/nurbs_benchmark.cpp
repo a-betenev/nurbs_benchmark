@@ -47,6 +47,14 @@
 #include <tinynurbs/tinynurbs.h>
 #endif
 
+// If SISL library is available, use it
+#if __has_include(<sisl.h>)
+#define HAS_SISL
+#endif
+#ifdef HAS_SISL
+#include <sisl.h>
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #include <powerbase.h>
@@ -58,6 +66,7 @@ enum class Library {
   Parasolid,
   Poisson,
   TinyNurbs,
+  SISL,
   LNLib
 };
 
@@ -486,6 +495,13 @@ struct SurfaceResult
   gp_Pnt P;
   gp_Vec D1u, D1v;
   gp_Vec D2uu, D2vv, D2uv;
+
+  static inline gp_XYZ nanXYZ()
+  {
+    return { NAN, NAN, NAN };
+  }
+
+  SurfaceResult() : P(nanXYZ()), D1u(nanXYZ()), D1v(nanXYZ()), D2uu(nanXYZ()), D2vv(nanXYZ()), D2uv(nanXYZ()) {}
 };
 
 /**
@@ -681,6 +697,182 @@ void evaluateSurfacesDegree2(const std::vector<tinynurbs::Surface<double>>& surf
 }
 
 #endif /* HAS_TINYNURBS */
+
+#ifdef HAS_SISL
+
+struct SISLSurfDeleter
+{
+  void operator()(SISLSurf* surf) const
+  {
+    if (surf) {
+      freeSurf(surf);
+    }
+  }
+};
+
+// Type alias for convenience
+using UniqueSISLSurf = std::unique_ptr<SISLSurf, SISLSurfDeleter>;
+
+/**
+ * Convert an Open CASCADE B-spline surface to a SISL SISLSurf structure.
+ *
+ * @param surf  OCCT surface handle (Geom_BSplineSurface)
+ * @return      SISL surface pointer, or null on failure
+ */
+UniqueSISLSurf ConvertToSISL(const Handle(Geom_BSplineSurface)& surf)
+{
+  if (surf.IsNull())
+    return nullptr;
+
+  // 1. Degrees and orders
+  int degU = surf->UDegree();
+  int degV = surf->VDegree();
+  int orderU = degU + 1;
+  int orderV = degV + 1;
+
+  int nbPolesU = surf->NbUPoles();
+  int nbPolesV = surf->NbVPoles();
+
+  bool isRational = surf->IsURational() || surf->IsVRational();
+  const int dim = 3;
+
+  // 2. Knot vectors - directly from the pre-expanded sequences
+  const TColStd_Array1OfReal& seqU = surf->UKnotSequence();
+  const TColStd_Array1OfReal& seqV = surf->VKnotSequence();
+
+  // Copy to std::vector for SISL
+  std::vector<double> knotU(seqU.Length());
+  std::vector<double> knotV(seqV.Length());
+
+  for (int i = seqU.Lower(); i <= seqU.Upper(); ++i)
+    knotU[i - seqU.Lower()] = seqU(i);
+  for (int i = seqV.Lower(); i <= seqV.Upper(); ++i)
+    knotV[i - seqV.Lower()] = seqV(i);
+
+  // 3. Control points and weights
+  const TColgp_Array2OfPnt& poles = surf->Poles();
+  const TColStd_Array2OfReal* weights = surf->Weights();
+
+  // 4. Build coefficient array
+  int coefStride = isRational ? (dim + 1) : dim;
+  int totalCoef = nbPolesU * nbPolesV * coefStride;
+  std::vector<double> coef(totalCoef);
+
+  for (int i = 1; i <= nbPolesU; ++i) {
+    for (int j = 1; j <= nbPolesV; ++j) {
+      int idx = ((j - 1) * nbPolesU + (i - 1)) * coefStride;
+
+      const gp_Pnt& p = poles(i, j);
+      coef[idx + 0] = p.X();
+      coef[idx + 1] = p.Y();
+      coef[idx + 2] = p.Z();
+
+      if (isRational) {
+        coef[idx + 3] = (weights ? weights->Value(i, j) : 1.);
+      }
+    }
+  }
+
+  int kind = isRational ? 2 : 1;
+
+  // 6. Create SISL surface
+  UniqueSISLSurf result(newSurf(nbPolesU, nbPolesV, orderU, orderV,
+                                knotU.data(), knotV.data(), coef.data(), kind, dim, true));
+
+  return result;
+}
+
+/**
+ * Evaluate points on surfaces with derivative degree 0 (just points)
+ */
+void evaluateSurfacesDegree0(const std::vector<UniqueSISLSurf>& surfaces,
+                             const std::vector<std::vector<std::pair<double, double>>>& allUVPoints,
+                             std::vector<std::vector<SurfaceResult>>& allPoints)
+{
+  for (size_t sidx = 0; sidx < surfaces.size(); ++sidx) {
+    const auto& surf = surfaces[sidx];
+    const auto& uvPoints = allUVPoints[sidx];
+    auto& points = allPoints[sidx];
+
+    int i = 0, jstat = 0;
+    int ileft1 = 0, ileft2 = 0; // index of interval cached?
+    for (auto& uvpair : uvPoints) {
+      double uv[2] = { uvpair.first, uvpair.second };
+      double eder[3];
+      s1425(surf.get(), 0, 0, 0, 0, uv, &ileft1, &ileft2, eder, &jstat);
+      if (jstat) {
+        std::cerr << "Point evaluation failed with error code: " << jstat << std::endl;
+      }
+      points[i++].P.SetCoord(eder[0], eder[1], eder[2]);
+    }
+  }
+}
+
+/**
+ * Evaluate points on surfaces with derivative degree 1
+ */
+void evaluateSurfacesDegree1(const std::vector<UniqueSISLSurf>& surfaces,
+                             const std::vector<std::vector<std::pair<double, double>>>& allUVPoints,
+                             std::vector<std::vector<SurfaceResult>>& allPoints)
+{
+  for (size_t sidx = 0; sidx < surfaces.size(); ++sidx) {
+    const auto& surf = surfaces[sidx];
+    const auto& uvPoints = allUVPoints[sidx];
+    auto& points = allPoints[sidx];
+
+    int i = 0, jstat = 0;
+    int ileft1 = 0, ileft2 = 0; // index of interval cached?
+    for (auto& uvpair : uvPoints) {
+      double uv[2] = { uvpair.first, uvpair.second };
+      double eder[12];
+      s1425(surf.get(), 1, 1, 0, 0, uv, &ileft1, &ileft2, eder, &jstat);
+      if (jstat) {
+        std::cerr << "Point evaluation failed with error code: " << jstat << std::endl;
+      }
+      SurfaceResult& r = points[i++];
+      r.P.SetCoord(eder[0], eder[1], eder[2]);
+      r.D1u.SetCoord(eder[3], eder[4], eder[5]);
+      r.D1v.SetCoord(eder[6], eder[7], eder[8]);
+    }
+  }
+}
+
+/**
+ * Evaluate points on surfaces with derivative degree 2
+ */
+void evaluateSurfacesDegree2(const std::vector<UniqueSISLSurf>& surfaces,
+                             const std::vector<std::vector<std::pair<double, double>>>& allUVPoints,
+                             std::vector<std::vector<SurfaceResult>>& allPoints)
+{
+  for (size_t sidx = 0; sidx < surfaces.size(); ++sidx) {
+    const auto& surf = surfaces[sidx];
+    const auto& uvPoints = allUVPoints[sidx];
+    auto& points = allPoints[sidx];
+
+    int i = 0, jstat = 0;
+    int ileft1 = 0, ileft2 = 0; // index of interval cached?
+    for (auto& uvpair : uvPoints) {
+      double uv[2] = { uvpair.first, uvpair.second };
+      double eder[27];
+      s1425(surf.get(), 2, 2, 0, 0, uv, &ileft1, &ileft2, eder, &jstat);
+      if (jstat) {
+        std::cerr << "Point evaluation failed with error code: " << jstat << std::endl;
+      }
+      SurfaceResult& r = points[i++];
+      r.P.SetCoord(eder[0], eder[1], eder[2]);
+      r.D1u.SetCoord(eder[3], eder[4], eder[5]);
+      r.D2uu.SetCoord(eder[6], eder[7], eder[8]);
+      r.D1v.SetCoord(eder[9], eder[10], eder[11]);
+      r.D2uv.SetCoord(eder[12], eder[13], eder[14]);
+      // Duuv not used
+      r.D2vv.SetCoord(eder[18], eder[19], eder[20]);
+      // Duvv not used
+      // Duuvv not used
+    }
+  }
+}
+
+#endif /* HAS_SISL */
 
 /**
  * Dump surface evaluation results
@@ -938,7 +1130,29 @@ PerfResult benchmarkSurfaces(const TopoDS_Shape& shape,
     throw std::runtime_error("The executable is built without TinyNurbs support");
 #endif
   }
+  else if (lib == Library::SISL)
+  {
+#ifdef HAS_SISL
+    std::vector<UniqueSISLSurf> surfacesSISL;
+    for (int i = 0; i < surfaces.size(); ++i) {
+      surfacesSISL.emplace_back(std::move(ConvertToSISL(surfaces[i].BSpline())));
+    }
 
+    switch (derivDegree) {
+    case 0:
+      result = measureTime([&]() {evaluateSurfacesDegree0(surfacesSISL, allUVPoints, allPoints); }, numRepeats);
+      break;
+    case 1:
+      result = measureTime([&]() {evaluateSurfacesDegree1(surfacesSISL, allUVPoints, allPoints); }, numRepeats);
+      break;
+    case 2:
+      result = measureTime([&]() {evaluateSurfacesDegree2(surfacesSISL, allUVPoints, allPoints); }, numRepeats);
+      break;
+    }
+#else
+    throw std::runtime_error("The executable is built without SISL support");
+#endif
+  }
   // Output either summary of surface propeties or all points evaluated
   dumpSurfaceResults(surfaces, allUVPoints, allPoints, recordOutput ? derivDegree : -1);
 
@@ -1026,6 +1240,9 @@ int main(int argc, char* argv[])
     if (argc > 9) {
       if (libStr == "tinynurbs") {
         lib = Library::TinyNurbs;
+      }
+      else if (libStr == "sisl") {
+        lib = Library::SISL;
       }
       else if (libStr != "occt") {
         throw std::runtime_error("Unsupported library type: '" + libStr + "'");

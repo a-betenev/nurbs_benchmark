@@ -7,6 +7,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Find OCCT
 find_package(OpenCASCADE REQUIRED)
 
+# Find SISL
+find_package(SISL OPTIONAL)
+
 add_executable(nurbs_benchmark src/nurbs_benchmark.cpp)
 
 # enable AVX2 instructions for speed
@@ -14,6 +17,7 @@ target_compile_options(nurbs_benchmark PRIVATE $<$<BOOL:${MSVC}>:/arch:AVX2>)
 
 target_link_libraries(nurbs_benchmark
     ${OpenCASCADE_LIBRARIES}
+    ${sisl_LIBRARIES}
 )
 
 target_include_directories(nurbs_benchmark PRIVATE
@@ -23,6 +27,10 @@ target_include_directories(nurbs_benchmark PRIVATE
 target_include_directories(nurbs_benchmark PRIVATE
     ${CMAKE_SOURCE_DIR}/submodules/tinynurbs/include
     ${CMAKE_SOURCE_DIR}/submodules/glm
+)
+
+target_include_directories(nurbs_benchmark PRIVATE
+    ${sisl_INCLUDE_DIRS}
 )
 
 set_target_properties(nurbs_benchmark PROPERTIES VS_DEBUGGER_ENVIRONMENT "PATH=%PATH%;${OpenCASCADE_DIR}/../win64/vc14/bin")
