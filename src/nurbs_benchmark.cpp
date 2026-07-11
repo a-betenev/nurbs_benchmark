@@ -719,9 +719,9 @@ void dumpSurfaceResults(const std::vector<BRepAdaptor_Surface>& surfaces,
       std::cout << " u " << u << " v " << v;
 
       const SurfaceResult& r = points[i++];
-      const gp_Pnt& P = points[i].P;
-      const gp_Vec& D1u = points[i].D1u, D1v = points[i].D1v;
-      const gp_Vec& D2uu = points[i].D2uu, D2vv = points[i].D2vv, D2uv = points[i].D2uv;
+      const gp_Pnt& P = r.P;
+      const gp_Vec& D1u = r.D1u, &D1v = r.D1v;
+      const gp_Vec& D2uu = r.D2uu, &D2vv = r.D2vv, &D2uv = r.D2uv;
 
       std::cout << " P (" << P.X() << "," << P.Y() << "," << P.Z() << ")";
       if (derivDegree > 0) {
