@@ -17,6 +17,11 @@ target_include_directories(nurbs_benchmark PRIVATE
     ${OpenCASCADE_INCLUDE_DIR}
 )
 
+target_include_directories(nurbs_benchmark PRIVATE
+    ${CMAKE_SOURCE_DIR}/submodules/tinynurbs/include
+    ${CMAKE_SOURCE_DIR}/submodules/glm
+)
+
 # On Windows, enerate the bat file to run tests
 file(GENERATE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/nurbs_benchmark_grid.bat CONTENT
 ":: Set path to OCCT and launch test with specified options;

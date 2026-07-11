@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <cmath>
 #include <ctime>
+#include <variant>
 
 #include <BRepTools.hxx>
 #include <BRep_Builder.hxx>
@@ -28,16 +29,37 @@
 #include <gp_Pnt.hxx>
 #include <gp_Vec.hxx>
 #include <STEPControl_Reader.hxx>
+#include <TColStd_Array1OfReal.hxx>
+#include <TColStd_Array1OfInteger.hxx>
+#include <TColgp_Array2OfPnt.hxx>
+#include <TColStd_Array2OfReal.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Shape.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 
+// If TinyNurbs library is available (in submodules), use it
+#if __has_include(<tinynurbs/tinynurbs.h>)
+#define HAS_TINYNURBS
+#endif
+#ifdef HAS_TINYNURBS
+#include <tinynurbs/tinynurbs.h>
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #include <powerbase.h>
 #pragma comment(lib, "PowrProf.lib")
+
+enum class Library {
+  OCCT,
+  ACIS,
+  Parasolid,
+  Poisson,
+  TinyNurbs,
+  LNLib
+};
 
  //! Query maximal processor frequency, 0. if failed
 static double GetCPUFrequency()
@@ -92,7 +114,7 @@ double GetProcessCPU()
   */
 void printUsage(const char* progName)
 {
-  std::cout << "Usage: " << progName << " <file> <curves|surfaces> <indices> <numPoints> <numRepeats> <random|sequential> <derivDegree(0-2)> <perf|record>\n";
+  std::cout << "Usage: " << progName << " <file> <curves|surfaces> <indices> <numPoints> <numRepeats> <random|sequential> <derivDegree(0-2)> <perf|record> [lib]\n";
   std::cout << "  <file>        - Path to .brep or .step file\n";
   std::cout << "  <curves|surfaces> - Choose to evaluate curves or surfaces\n";
   std::cout << "  <indices>     - Comma-separated list of edge (for curves) or face (for surfaces) indices (1-based),\n";
@@ -102,6 +124,7 @@ void printUsage(const char* progName)
   std::cout << "  <random|sequential> - Parameter distribution mode\n";
   std::cout << "  <derivDegree> - Derivative degree (0, 1, or 2)\n";
   std::cout << "  <perf|record> - Output mode: performance measurement or result recording\n";
+  std::cout << "  lib           - Librray to be used: occt (default) or tinynurbs\n";
   std::cout << "\nExample: " << progName << " model.step curves 1,2,3 10000 10 random 1 perf\n";
 }
 
@@ -524,6 +547,141 @@ void evaluateSurfacesDegree2(const std::vector<BRepAdaptor_Surface>& surfaces,
   }
 }
 
+#ifdef HAS_TINYNURBS
+
+/**
+ * Convert an Open CASCADE B-spline surface to a TinyNURBS surface.
+ *
+ * @param surf OCCT handle to Geom_BSplineSurface.
+ * @return A TinyNURBS Surface (non-rational) or RationalSurface (if rational).
+ *         Use std::variant or overloads to handle both cases.
+ *
+ * Note: TinyNURBS uses glm::vec3 for points and array2<T> for 2D structures.
+ */
+//std::variant<tinynurbs::Surface<double>, tinynurbs::RationalSurface<double>>
+tinynurbs::Surface<double> ConvertToTinyNurbs(const Handle(Geom_BSplineSurface)& surf)
+{
+  if (surf.IsNull()) {
+    throw std::runtime_error("Surface is not a BSpline, not supported by TinyNurbs library");
+  }
+  if (surf->IsURational() || surf->IsVRational()) {
+    throw std::runtime_error("Evaluation of rational surfaces in TinyNurbs is extremely slow, not supported");
+  }
+
+  unsigned int degU = surf->UDegree();
+  unsigned int degV = surf->VDegree();
+
+  const TColStd_Array1OfReal& uKnots = surf->UKnotSequence();
+  const TColStd_Array1OfReal& vKnots = surf->VKnotSequence();
+
+  std::vector<double> knotsU, knotsV;
+  for (int i = uKnots.Lower(); i <= uKnots.Upper(); ++i) {
+    knotsU.push_back(uKnots(i));
+  }
+  for (int i = vKnots.Lower(); i <= vKnots.Upper(); ++i) {
+    knotsV.push_back(vKnots(i));
+  }
+
+  int nbPolesU = surf->NbUPoles();
+  int nbPolesV = surf->NbVPoles();
+
+  const TColgp_Array2OfPnt& poles = surf->Poles();
+  const TColStd_Array2OfReal*  weights = surf->Weights();
+
+  tinynurbs::array2<glm::vec<3, double>> ctrlPts(nbPolesU, nbPolesV);
+//  tinynurbs::array2<double> wVec(nbPolesU, nbPolesV);
+
+  for (int i = 1; i <= nbPolesU; ++i) {
+    for (int j = 1; j <= nbPolesV; ++j) {
+      const gp_Pnt& p = poles(i, j);
+      ctrlPts(i - 1, j - 1) = glm::vec3(p.X(), p.Y(), p.Z());
+//      wVec(i - 1, j - 1) = weights->Value(i, j);
+    }
+  }
+
+  // RationalSurface constructor:
+  // RationalSurface(deg_u, deg_v, knots_u, knots_v, control_points, weights)
+//  if (surf->IsURational() || surf->IsVRational()) {
+//    return tinynurbs::RationalSurface<double>(degU, degV, knotsU, knotsV, ctrlPts, wVec);
+  //}
+  //else {
+    return tinynurbs::Surface<double>(degU, degV, knotsU, knotsV, ctrlPts);
+  //}
+}
+
+/**
+ * Evaluate points on surfaces with derivative degree 0 (just points)
+ */
+void evaluateSurfacesDegree0(const std::vector<tinynurbs::Surface<double>>& surfaces,
+                             const std::vector<std::vector<std::pair<double, double>>>& allUVPoints,
+                             std::vector<std::vector<SurfaceResult>>& allPoints)
+{
+  for (size_t sidx = 0; sidx < surfaces.size(); ++sidx) {
+    const auto& surf = surfaces[sidx];
+    const auto& uvPoints = allUVPoints[sidx];
+    auto& points = allPoints[sidx];
+
+    int i = 0;
+    for (auto& [u, v] : uvPoints) {
+      auto pnt = tinynurbs::surfacePoint(surf, u, v);
+      points[i++].P.SetCoord(pnt.x, pnt.y, pnt.z);
+    }
+  }
+}
+
+/**
+ * Evaluate points on surfaces with derivative degree 1
+ */
+void evaluateSurfacesDegree1(const std::vector<tinynurbs::Surface<double>>& surfaces,
+                             const std::vector<std::vector<std::pair<double, double>>>& allUVPoints,
+                             std::vector<std::vector<SurfaceResult>>& allPoints)
+{
+  for (size_t sidx = 0; sidx < surfaces.size(); ++sidx) {
+    const auto& surf = surfaces[sidx];
+    const auto& uvPoints = allUVPoints[sidx];
+    auto& points = allPoints[sidx];
+
+    int i = 0;
+    for (auto& [u, v] : uvPoints) {
+      auto pnt = tinynurbs::surfacePoint(surf, u, v);
+      auto d1 = tinynurbs::surfaceDerivatives(surf, 1, u, v);
+      SurfaceResult& r = points[i++];
+      r.P.SetCoord(d1(0, 0).x, d1(0, 0).y, d1(0, 0).z);
+      r.D1u.SetCoord(d1(1, 0).x, d1(1, 0).y, d1(1, 0).z);
+      r.D1v.SetCoord(d1(0, 1).x, d1(0, 1).y, d1(0, 1).z);
+    }
+  }
+}
+
+/**
+ * Evaluate points on surfaces with derivative degree 2
+ */
+void evaluateSurfacesDegree2(const std::vector<tinynurbs::Surface<double>>& surfaces,
+                             const std::vector<std::vector<std::pair<double, double>>>& allUVPoints,
+                             std::vector<std::vector<SurfaceResult>>& allPoints)
+{
+  for (size_t sidx = 0; sidx < surfaces.size(); ++sidx) {
+    const auto& surf = surfaces[sidx];
+    const auto& uvPoints = allUVPoints[sidx];
+    auto& points = allPoints[sidx];
+
+    int i = 0;
+    for (auto& [u, v] : uvPoints) {
+      auto pnt = tinynurbs::surfacePoint(surf, u, v);
+      auto d2 = tinynurbs::surfaceDerivatives(surf, 2, u, v);
+      SurfaceResult& r = points[i++];
+      r.P.SetCoord(d2(0, 0).x, d2(0, 0).y, d2(0, 0).z);
+      r.D1u.SetCoord(d2(1, 0).x, d2(1, 0).y, d2(1, 0).z);
+      r.D1v.SetCoord(d2(0, 1).x, d2(0, 1).y, d2(0, 1).z);
+      r.D2uu.SetCoord(d2(2, 0).x, d2(2, 0).y, d2(2, 0).z);
+      r.D2vv.SetCoord(d2(0, 2).x, d2(0, 2).y, d2(0, 2).z);
+      r.D2uv.SetCoord(d2(1, 1).x, d2(1, 1).y, d2(1, 1).z);
+    }
+  }
+}
+
+#endif /* HAS_TINYNURBS */
+
 /**
  * Dump surface evaluation results
  */
@@ -689,7 +847,8 @@ PerfResult benchmarkSurfaces(const TopoDS_Shape& shape,
                              int numRepeats,
                              bool randomMode,
                              int derivDegree,
-                             bool recordOutput)
+                             bool recordOutput,
+                             Library lib)
 {
   // Collect all faces from the shape
   std::vector<TopoDS_Face> faces;
@@ -740,18 +899,44 @@ PerfResult benchmarkSurfaces(const TopoDS_Shape& shape,
     checkCorner(surf, true, true);
   }
 
-  // Select and execute the appropriate evaluation function based on mode and degree
+  // Select and execute the appropriate evaluation function based on selected library, mode, and degree
   PerfResult result{};
-  switch (derivDegree) {
-  case 0:
-    result = measureTime([&]() {evaluateSurfacesDegree0(surfaces, allUVPoints, allPoints); }, numRepeats);
-    break;
-  case 1:
-    result = measureTime([&]() {evaluateSurfacesDegree1(surfaces, allUVPoints, allPoints); }, numRepeats);
-    break;
-  case 2:
-    result = measureTime([&]() {evaluateSurfacesDegree2(surfaces, allUVPoints, allPoints); }, numRepeats);
-    break;
+  if (lib == Library::OCCT)
+  {
+    switch (derivDegree) {
+    case 0:
+      result = measureTime([&]() {evaluateSurfacesDegree0(surfaces, allUVPoints, allPoints); }, numRepeats);
+      break;
+    case 1:
+      result = measureTime([&]() {evaluateSurfacesDegree1(surfaces, allUVPoints, allPoints); }, numRepeats);
+      break;
+    case 2:
+      result = measureTime([&]() {evaluateSurfacesDegree2(surfaces, allUVPoints, allPoints); }, numRepeats);
+      break;
+    }
+  }
+  else if (lib == Library::TinyNurbs)
+  {
+#ifdef HAS_TINYNURBS
+    std::vector<tinynurbs::Surface<double>> surfacesTn;
+    for (int i = 0; i < surfaces.size(); ++i) {
+      surfacesTn.push_back(ConvertToTinyNurbs(surfaces[i].BSpline()));
+    }
+
+    switch (derivDegree) {
+    case 0:
+      result = measureTime([&]() {evaluateSurfacesDegree0(surfacesTn, allUVPoints, allPoints); }, numRepeats);
+      break;
+    case 1:
+      result = measureTime([&]() {evaluateSurfacesDegree1(surfacesTn, allUVPoints, allPoints); }, numRepeats);
+      break;
+    case 2:
+      result = measureTime([&]() {evaluateSurfacesDegree2(surfacesTn, allUVPoints, allPoints); }, numRepeats);
+      break;
+    }
+#else
+    throw std::runtime_error("The executable is built without TinyNurbs support");
+#endif
   }
 
   // Output either summary of surface propeties or all points evaluated
@@ -801,12 +986,25 @@ void StabilizeForMinMeasurement()
 }
 
 /**
+ * Helper function generating string representing current time in ISO format
+ */
+static std::string GetCurrentTimeString()
+{
+  auto now = std::chrono::system_clock::now();
+  std::time_t time = std::chrono::system_clock::to_time_t(now);
+
+  std::stringstream ss;
+  ss << std::put_time(std::localtime(&time), "%FT%T");
+  return ss.str();
+};
+
+/**
  * Main entry point
  */
 int main(int argc, char* argv[])
 {
   // Parse command line arguments
-  if (argc != 9) {
+  if (argc != 9 && argc != 10) {
     printUsage(argv[0]);
     return 1;
   }
@@ -822,6 +1020,17 @@ int main(int argc, char* argv[])
     std::string modeStr = argv[6];
     int derivDegree = std::stoi(argv[7]);
     std::string outputStr = argv[8];
+
+    std::string libStr = (argc > 9 ? argv[9] : "occt");
+    Library lib = Library::OCCT;
+    if (argc > 9) {
+      if (libStr == "tinynurbs") {
+        lib = Library::TinyNurbs;
+      }
+      else if (libStr != "occt") {
+        throw std::runtime_error("Unsupported library type: '" + libStr + "'");
+      }
+    }
 
     // Validate arguments
     if (numPoints < 0) {
@@ -872,15 +1081,7 @@ int main(int argc, char* argv[])
     }
 
     // Print timestamp
-    auto getTime = []() {
-      auto now = std::chrono::system_clock::now();
-      std::time_t time = std::chrono::system_clock::to_time_t(now);
-
-      std::stringstream ss;
-      ss << std::put_time(std::localtime(&time), "%FT%T");
-      return ss.str();
-    };
-    std::cout << getTime() << std::endl;
+    std::cout << GetCurrentTimeString() << std::endl;
 
     // Load shape
     std::cout << "Loading shape from: " << filePath << std::endl;
@@ -905,7 +1106,7 @@ int main(int argc, char* argv[])
         std::cout << indices[i];
       }
       std::cout << ")" << std::endl << std::endl;
-      result = benchmarkSurfaces(shape, indices, numPoints, numRepeats, isRandom, derivDegree, recordOutput);
+      result = benchmarkSurfaces(shape, indices, numPoints, numRepeats, isRandom, derivDegree, recordOutput, lib);
     }
 
     // Output performance summary
@@ -922,7 +1123,7 @@ int main(int argc, char* argv[])
       }
 
       // Output one-line information on a call and results to cerr for statistics
-      std::cerr << getTime() << " ";
+      std::cerr << GetCurrentTimeString() << " ";
       for (int i = 1; i < argc; i++) {
         std::cerr << argv[i] << " ";
       }
@@ -933,7 +1134,14 @@ int main(int argc, char* argv[])
     }
   }
   catch (const std::exception& e) {
+    std::cerr << GetCurrentTimeString() << " ";
+    for (int i = 1; i < argc; i++) {
+      std::cerr << argv[i] << " ";
+    }
     std::cerr << "Error: " << e.what() << std::endl;
+    if (std::cout.rdbuf() != std::cerr.rdbuf()) {
+      std::cout << "Error: " << e.what() << std::endl;
+    }
     return 1;
   }
 

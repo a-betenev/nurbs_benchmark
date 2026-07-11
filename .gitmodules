@@ -1,0 +1,6 @@
+[submodule "tinynurbs"]
+	path = submodules/tinynurbs
+	url = https://github.com/pradeep-pyro/tinynurbs.git
+[submodule "glm"]
+	path = submodules/glm
+	url = https://github.com/g-truc/glm.git
