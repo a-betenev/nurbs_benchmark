@@ -1010,24 +1010,43 @@ PerfResult benchmarkCurves(const TopoDS_Shape& shape,
  * in the case if both U and V multiplicities at that corner are equal to degree + 1.
  * This allows to check accuracy of evaluation against ground truth.
  */
-void checkCorner(const BRepAdaptor_Surface& surf, bool takeMinU, bool takeMinV)
+void checkCorners(const BRepAdaptor_Surface& surf,
+                  const std::vector<std::pair<double, double>>& uvParams,
+                  const std::vector<SurfaceResult>& results)
 {
   Handle(Geom_BSplineSurface) bspl = surf.BSpline();
   if (!bspl)
   {
-    return;
+    return; // nothing to check
   }
-  if (bspl->UMultiplicity(takeMinU ? 1 : bspl->NbUKnots()) != bspl->UDegree() + 1||
-      bspl->VMultiplicity(takeMinV ? 1 : bspl->NbVKnots()) != bspl->VDegree() + 1)
-  {
-    return;
+
+  // iterate by corners
+  for (bool takeMinU : {true, false}) {
+    for (bool takeMinV : {true, false}) {
+      if (bspl->UMultiplicity(takeMinU ? 1 : bspl->NbUKnots()) != bspl->UDegree() + 1 ||
+          bspl->VMultiplicity(takeMinV ? 1 : bspl->NbVKnots()) != bspl->VDegree() + 1)
+      {
+        continue; // surface is not clamped at that corner (does not pass through the pole)
+      }
+
+      double uCorner = bspl->UKnot(takeMinU ? 1 : bspl->NbUKnots());
+      double vCorner = bspl->VKnot(takeMinV ? 1 : bspl->NbVKnots());
+
+      for (size_t i = 0; i < uvParams.size(); ++i) {
+        double u = uvParams[i].first;
+        double v = uvParams[i].second;
+
+        // note: here we check for exact equality because this code is intended to check
+        // the points evaluated exactly at corners
+        if (u == uCorner && v == vCorner) {
+          gp_Pnt pole = bspl->Pole(takeMinU ? 1 : bspl->NbUPoles(), takeMinV ? 1 : bspl->NbVPoles());
+          Standard_Real dist = pole.Distance(results[i].P);
+          std::cout << "Corner [" << (takeMinU ? 0 : 1) << ", " << (takeMinV ? 0 : 1) <<
+            "] distance to pole = " << dist << std::endl;
+        }
+      }
+    }
   }
-  gp_Pnt pole = bspl->Pole(takeMinU ? 1 : bspl->NbUPoles(), takeMinV ? 1 : bspl->NbVPoles());
-  gp_Pnt corner = surf.Value(bspl->UKnot(takeMinU ? 1 : bspl->NbUKnots()),
-                             bspl->VKnot(takeMinV ? 1 : bspl->NbVKnots()));
-  Standard_Real dist = pole.Distance(corner);
-  std::cout << "Corner [" << (takeMinU ? 0 : 1) << ", " << (takeMinV ? 0 : 1) <<
-    "] distance to pole = " << dist << std::endl;
 }
 
 /**
@@ -1083,12 +1102,6 @@ PerfResult benchmarkSurfaces(const TopoDS_Shape& shape,
     }
 
     allPoints.emplace_back(allUVPoints.back().size());
-
-    // Check evaluation of points at corners of the surface (only for clamped BSplines)
-    checkCorner(surf, false, false);
-    checkCorner(surf, false, true);
-    checkCorner(surf, true, false);
-    checkCorner(surf, true, true);
   }
 
   // Select and execute the appropriate evaluation function based on selected library, mode, and degree
@@ -1153,6 +1166,17 @@ PerfResult benchmarkSurfaces(const TopoDS_Shape& shape,
     throw std::runtime_error("The executable is built without SISL support");
 #endif
   }
+
+  // For special case of 4 sequential points, which may be located exactly at
+  // the corners of the surface (if face is built on natural range of the surface),
+  // check them against ground-truth (corner poles), only for clamped surfaces
+  if (numPoints == 4 && !randomMode)
+  {
+    for (size_t i = 0; i < surfaces.size(); ++i) {
+      checkCorners(surfaces[i], allUVPoints[i], allPoints[i]);
+    }
+  }
+
   // Output either summary of surface propeties or all points evaluated
   dumpSurfaceResults(surfaces, allUVPoints, allPoints, recordOutput ? derivDegree : -1);
 
