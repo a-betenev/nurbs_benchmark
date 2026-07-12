@@ -9,6 +9,9 @@ find_package(OpenCASCADE REQUIRED)
 
 add_executable(nurbs_benchmark src/nurbs_benchmark.cpp)
 
+# enable AVX2 instructions for speed
+target_compile_options(nurbs_benchmark PRIVATE $<$<BOOL:${MSVC}>:/arch:AVX2>)
+
 target_link_libraries(nurbs_benchmark
     ${OpenCASCADE_LIBRARIES}
 )
@@ -21,6 +24,8 @@ target_include_directories(nurbs_benchmark PRIVATE
     ${CMAKE_SOURCE_DIR}/submodules/tinynurbs/include
     ${CMAKE_SOURCE_DIR}/submodules/glm
 )
+
+set_target_properties(nurbs_benchmark PROPERTIES VS_DEBUGGER_ENVIRONMENT "PATH=%PATH%;${OpenCASCADE_DIR}/../win64/vc14/bin")
 
 # On Windows, enerate the bat file to run tests
 file(GENERATE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/nurbs_benchmark_grid.bat CONTENT
