@@ -8,7 +8,9 @@
 ::   each file is tested with different options, overall 10 iterations for statistics
 ::   (use the lower CPU and elapsed time values among all runs as a measure)
 ::
-:: - with single argument: probe all files in the folder specified by this argument,
+:: - with single argument: run standard tests using the library specified by this argument
+::
+:: - with two arguments: probe all files in the folder specified by this argument,
 ::   outputting information on their surfaces and curves
 ::
 :: - with multiple arguments: run benchmark with specified arguments
@@ -21,23 +23,42 @@ set "EXE=%BUILD_PATH%\Release\nurbs_benchmark.exe"
 
 setlocal enabledelayedexpansion
 
+set lib=occt
 if "%1" == "" (
-  set mode=test
+  set purpose=test
 ) else if "%2" == "" (
-  set mode=probe
+  set purpose=test
+  set "lib=%1"
+) else if "%2" == "" (
+  set purpose=probe
   set "probedir=%1"
 ) else (
-  set mode=file
+  set purpose=file
 )
 
-if "%mode%" == "test" (
+if "%purpose%" == "test" (
 
   echo Running standard tests...
   for /L %%i in (1,1,10) do (
     for %%a in (
-      "terrain.step surfaces 1 1000000 500"
-      "hammer.step surfaces 1-45 1000000 500"
-      "sphere_nurbs.step surfaces 1 1000000 500"
+      "terrain.step surfaces 1 100000 100"
+      "hammer.step surfaces 1-45 10000 100"
+      "sphere_nurbs.step surfaces 1 100000 100"
+      "nurbs1.step surfaces 1 100000 1000"
+      "nurbs2.step surfaces 1 100000 1000"
+      "nurbs3.step surfaces 1 100000 1000"
+      "nurbs4.step surfaces 1 100000 1000"
+      "nurbs5.step surfaces 1 100000 1000"
+      "nurbs6.step surfaces 1 100000 1000"
+      "nurbs7.step surfaces 1 100000 1000"
+      "nurbs8.step surfaces 1 100000 1000"
+      "nurbs9.step surfaces 1 100000 1000"
+      "nurbs10.step surfaces 1 100000 1000"
+      "nurbs11.step surfaces 1 100000 1000"
+      "nurbs12.step surfaces 1 100000 1000"
+      "nurbs13.step surfaces 1 100000 1000"
+      "nurbs14.step surfaces 1 100000 1000"
+      "nurbs15.step surfaces 1 100000 1000"
     ) do (
       for %%o in ("sequential" "random") do (
         for /L %%d in (0,1,2) do (
@@ -45,19 +66,19 @@ if "%mode%" == "test" (
           echo =====================================================
           echo Iteration %%~i, case %%~a, %%~o, degree %%~d
           echo =====================================================
-          start /AFFINITY 1 /B /HIGH %EXE% %DATA_DIR%/%%~a %%~o %%~d perf 2>>runs.log
+          start /AFFINITY 1 /B /HIGH /WAIT %EXE% %DATA_DIR%/%%~a %%~o %%~d perf %lib% 2>>runs.log
         )
       )
     )
   )
 
-) else if "%mode%" == "probe" (
+) else if "%purpose%" == "probe" (
 
   echo Probing files in %probedir%...
 
   echo NOT IMPLEMENTED YET
 
-) else if "%mode%" == "file" (
+) else if "%purpose%" == "file" (
   echo Executing nurbs_benchmark %*
   %EXE% %* 2>>runs.log
 )
