@@ -254,7 +254,7 @@ PerfResult measureTime(Func&& func, int numRepeats)
   }
 
   unsigned __int64 total_tsc = __rdtsc() - start_tsc;
-  double total_cpu2 = GetProcessCPU();
+  double total_cpu2 = GetProcessCPU() - start_cpu2;
 
   auto end_wall = std::chrono::high_resolution_clock::now();
   auto end_cpu = std::clock();
@@ -442,7 +442,7 @@ void dumpCurveResults(const std::vector<BRepAdaptor_Curve>& curves,
                       const std::vector<std::vector<double>>& allParams,
                       const std::vector<std::vector<CurveResult>>& allPoints, int derivDegree)
 {
-  std::cout << std::setprecision(15);
+  std::cout << std::setprecision(std::numeric_limits<double>::max_digits10);
   for (size_t cidx = 0; cidx < curves.size(); ++cidx) {
     const auto& curve = curves[cidx];
     const auto& params = allParams[cidx];
@@ -881,7 +881,7 @@ void dumpSurfaceResults(const std::vector<BRepAdaptor_Surface>& surfaces,
                         const std::vector<std::vector<std::pair<double, double>>>& allUVPoints,
                         const std::vector<std::vector<SurfaceResult>>& allPoints, int derivDegree)
 {
-  std::cout << std::setprecision(15);
+  std::cout << std::setprecision(std::numeric_limits<double>::max_digits10);
   for (size_t sidx = 0; sidx < surfaces.size(); ++sidx) {
     const auto& surf = surfaces[sidx];
     const auto& uvPoints = allUVPoints[sidx];
@@ -1309,7 +1309,6 @@ int main(int argc, char* argv[])
       recordOutput = true;
     }
     else if (outputStr == "perf") {
-      recordOutput = false;
     }
     else {
       throw std::runtime_error("Output mode must be 'perf' or 'record'");
