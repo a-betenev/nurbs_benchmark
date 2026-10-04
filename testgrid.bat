@@ -39,7 +39,7 @@ if "%1" == "" (
 if "%purpose%" == "test" (
 
   echo Running standard tests...
-  for /L %%i in (1,1,1) do (
+  for /L %%i in (1,1,10) do (
     for %%a in (
       "terrain.step surfaces 1 100000 100"
       "hammer.step surfaces 1-45 10000 100"
