@@ -31,6 +31,7 @@
 #include <STEPControl_Reader.hxx>
 #include <TColStd_Array1OfReal.hxx>
 #include <TColStd_Array1OfInteger.hxx>
+#include <TColgp_Array1OfPnt.hxx>
 #include <TColgp_Array2OfPnt.hxx>
 #include <TColStd_Array2OfReal.hxx>
 #include <TopExp_Explorer.hxx>
@@ -54,6 +55,37 @@
 #endif
 #ifdef HAS_SISL
 #include <sisl.h>
+#endif
+
+// If the ACIS kernel (Spatial/Dassault) is available, use it.
+// ACIS ships its headers either with the modern .hpp or the legacy .hxx
+// extension; detect whichever is present and remember it so the includes below
+// resolve consistently. bs3surf/bs3curve transitively pull in SPAposition,
+// SPAvector and SPApar_pos; kernapi provides api_initialize_acis().
+#if defined(__has_include)
+#  if __has_include(<bs3surf.hpp>)
+#    define HAS_ACIS 1
+#    define ACIS_HEADER(f) <f.hpp>
+#  elif __has_include(<bs3surf.hxx>)
+#    define HAS_ACIS 1
+#    define ACIS_HEADER(f) <f.hxx>
+#  endif
+#endif
+#ifdef HAS_ACIS
+#  include ACIS_HEADER(kernapi)
+#  include ACIS_HEADER(bs3curve)
+#  include ACIS_HEADER(bs3surf)
+#endif
+
+// If the Parasolid kernel (Siemens) is available, use it. The whole C API is
+// exposed through the single umbrella header <parasolid.h>.
+#if defined(__has_include)
+#  if __has_include(<parasolid.h>)
+#    define HAS_PARASOLID 1
+#  endif
+#endif
+#ifdef HAS_PARASOLID
+#  include <parasolid.h>
 #endif
 
 #ifdef _WIN32
@@ -135,7 +167,7 @@ void printUsage(const char* progName)
   std::cout << "  <derivDegree> - Derivative degree (0, 1, or 2)\n";
   std::cout << "  <perf|record|probe> - Output mode: performance measurement, result recording,\n";
   std::cout << "                  or geometry probe (report type/BSpline properties of every subshape, no evaluation)\n";
-  std::cout << "  lib           - Librray to be used: occt (default) or tinynurbs\n";
+  std::cout << "  lib           - Library to be used: occt (default), tinynurbs, sisl, acis, parasolid\n";
   std::cout << "\nExample: " << progName << " model.step curves 1,2,3 10000 10 random 1 perf\n";
 }
 
@@ -876,6 +908,554 @@ void evaluateSurfacesDegree2(const std::vector<UniqueSISLSurf>& surfaces,
 
 #endif /* HAS_SISL */
 
+#ifdef HAS_ACIS
+
+// ==================== ACIS BACKEND ====================
+//
+// Evaluation strategy: ACIS has no user-facing "adaptor + explicit cache" object
+// like OCCT's BRepAdaptor_Surface / BSplSLib_Cache. Its B-spline classes
+// (bs3_curve, bs3_surface) cache the active span internally, so the
+// spline-interface evaluators used below -- bs3_curve_eval() and
+// bs3_surface_evaluate() -- are the direct, lowest-overhead entry points and the
+// closest analogue to OCCT's cached evaluation of a Geom_BSpline*.
+// Alternatives (see README): the virtual curve::eval()/surface::eval() member
+// overloads, bs3_curve_evaluate()/bs3_surface_evaluate() with an arbitrary
+// derivative count, and the api_* / evaluation-through-FACE/EDGE routes.
+//
+// NOTE: bs3_curve / bs3_surface constructor signatures vary slightly between
+// ACIS releases. Verify the two `new bs3_curve(...)` / `new bs3_surface(...)`
+// calls below against the bs3curve / bs3surf headers of your ACIS version.
+
+static void AcisInitOnce()
+{
+  static bool s_initialized = false;
+  if (!s_initialized) {
+    api_initialize_acis();
+    s_initialized = true;
+  }
+}
+
+struct ACISCurveDeleter { void operator()(bs3_curve* c) const { delete c; } };
+struct ACISSurfDeleter  { void operator()(bs3_surface* s) const { delete s; } };
+using UniqueACISCurve = std::unique_ptr<bs3_curve, ACISCurveDeleter>;
+using UniqueACISSurf  = std::unique_ptr<bs3_surface, ACISSurfDeleter>;
+
+/**
+ * Build an ACIS bs3_curve from an OCCT B-spline curve.
+ */
+UniqueACISCurve ConvertToACIS(const Handle(Geom_BSplineCurve)& curve)
+{
+  AcisInitOnce();
+  if (curve.IsNull())
+    throw std::runtime_error("Curve is not a BSpline, not supported by ACIS backend");
+
+  const int order  = curve->Degree() + 1;
+  const int nPoles = curve->NbPoles();
+
+  // ACIS expects the fully expanded knot sequence (with multiplicities).
+  const TColStd_Array1OfReal& knots = curve->KnotSequence();
+  const int nKnots = knots.Length();
+  std::vector<double> knotVec(nKnots);
+  for (int i = knots.Lower(); i <= knots.Upper(); ++i)
+    knotVec[i - knots.Lower()] = knots(i);
+
+  const TColgp_Array1OfPnt& poles = curve->Poles();
+  std::vector<SPAposition> poleVec(nPoles);
+  for (int i = 1; i <= nPoles; ++i) {
+    const gp_Pnt& p = poles(i);
+    poleVec[i - 1] = SPAposition(p.X(), p.Y(), p.Z());
+  }
+
+  std::vector<double> weightVec;
+  double* weights = nullptr;
+  if (curve->IsRational()) {
+    const TColStd_Array1OfReal* w = curve->Weights();
+    weightVec.resize(nPoles);
+    for (int i = 1; i <= nPoles; ++i)
+      weightVec[i - 1] = w->Value(i);
+    weights = weightVec.data();
+  }
+
+  // bs3_curve(order, n_knots, knots, n_poles, poles, weights)
+  return UniqueACISCurve(new bs3_curve(order, nKnots, knotVec.data(),
+                                       nPoles, poleVec.data(), weights));
+}
+
+/**
+ * Build an ACIS bs3_surface from an OCCT B-spline surface.
+ */
+UniqueACISSurf ConvertToACIS(const Handle(Geom_BSplineSurface)& surf)
+{
+  AcisInitOnce();
+  if (surf.IsNull())
+    throw std::runtime_error("Surface is not a BSpline, not supported by ACIS backend");
+
+  const int uOrder = surf->UDegree() + 1;
+  const int vOrder = surf->VDegree() + 1;
+  const int nU = surf->NbUPoles();
+  const int nV = surf->NbVPoles();
+
+  const TColStd_Array1OfReal& uk = surf->UKnotSequence();
+  const TColStd_Array1OfReal& vk = surf->VKnotSequence();
+  std::vector<double> uKnots(uk.Length()), vKnots(vk.Length());
+  for (int i = uk.Lower(); i <= uk.Upper(); ++i) uKnots[i - uk.Lower()] = uk(i);
+  for (int i = vk.Lower(); i <= vk.Upper(); ++i) vKnots[i - vk.Lower()] = vk(i);
+
+  const TColgp_Array2OfPnt& poles = surf->Poles();
+  const bool rational = surf->IsURational() || surf->IsVRational();
+  const TColStd_Array2OfReal* weights = surf->Weights();
+
+  // ACIS stores the control net u-major: flat index = iU * nV + iV.
+  std::vector<SPAposition> poleVec(static_cast<size_t>(nU) * nV);
+  std::vector<double> weightVec;
+  if (rational) weightVec.resize(static_cast<size_t>(nU) * nV);
+  for (int i = 1; i <= nU; ++i) {
+    for (int j = 1; j <= nV; ++j) {
+      const size_t k = static_cast<size_t>(i - 1) * nV + (j - 1);
+      const gp_Pnt& p = poles(i, j);
+      poleVec[k] = SPAposition(p.X(), p.Y(), p.Z());
+      if (rational) weightVec[k] = weights->Value(i, j);
+    }
+  }
+
+  // bs3_surface(nU, nV, uOrder, vOrder, uKnots, vKnots, poles, weights)
+  return UniqueACISSurf(new bs3_surface(nU, nV, uOrder, vOrder,
+                                        uKnots.data(), vKnots.data(),
+                                        poleVec.data(),
+                                        rational ? weightVec.data() : nullptr));
+}
+
+// ---- curve evaluation ----
+void evaluateCurvesDegree0(const std::vector<UniqueACISCurve>& curves,
+                           const std::vector<std::vector<double>>& allParams,
+                           std::vector<std::vector<CurveResult>>& allPoints)
+{
+  for (size_t cidx = 0; cidx < curves.size(); ++cidx) {
+    const bs3_curve& c = *curves[cidx];
+    const auto& params = allParams[cidx];
+    auto& points = allPoints[cidx];
+    int i = 0;
+    for (double t : params) {
+      SPAposition pos;
+      bs3_curve_eval(t, c, pos);
+      points[i++].P.SetCoord(pos.x(), pos.y(), pos.z());
+    }
+  }
+}
+
+void evaluateCurvesDegree1(const std::vector<UniqueACISCurve>& curves,
+                           const std::vector<std::vector<double>>& allParams,
+                           std::vector<std::vector<CurveResult>>& allPoints)
+{
+  for (size_t cidx = 0; cidx < curves.size(); ++cidx) {
+    const bs3_curve& c = *curves[cidx];
+    const auto& params = allParams[cidx];
+    auto& points = allPoints[cidx];
+    int i = 0;
+    for (double t : params) {
+      SPAposition pos; SPAvector d1;
+      bs3_curve_eval(t, c, pos, d1);
+      CurveResult& r = points[i++];
+      r.P.SetCoord(pos.x(), pos.y(), pos.z());
+      r.D1.SetCoord(d1.x(), d1.y(), d1.z());
+    }
+  }
+}
+
+void evaluateCurvesDegree2(const std::vector<UniqueACISCurve>& curves,
+                           const std::vector<std::vector<double>>& allParams,
+                           std::vector<std::vector<CurveResult>>& allPoints)
+{
+  for (size_t cidx = 0; cidx < curves.size(); ++cidx) {
+    const bs3_curve& c = *curves[cidx];
+    const auto& params = allParams[cidx];
+    auto& points = allPoints[cidx];
+    int i = 0;
+    for (double t : params) {
+      SPAposition pos; SPAvector d1, d2;
+      bs3_curve_eval(t, c, pos, d1, d2);
+      CurveResult& r = points[i++];
+      r.P.SetCoord(pos.x(), pos.y(), pos.z());
+      r.D1.SetCoord(d1.x(), d1.y(), d1.z());
+      r.D2.SetCoord(d2.x(), d2.y(), d2.z());
+    }
+  }
+}
+
+// ---- surface evaluation ----
+// deriv[k] points to the (k+1)-th order derivative array, holding (k+2) vectors:
+//   deriv[0] -> [du, dv];  deriv[1] -> [duu, duv, dvv].
+void evaluateSurfacesDegree0(const std::vector<UniqueACISSurf>& surfaces,
+                             const std::vector<std::vector<std::pair<double, double>>>& allUVPoints,
+                             std::vector<std::vector<SurfaceResult>>& allPoints)
+{
+  for (size_t sidx = 0; sidx < surfaces.size(); ++sidx) {
+    const bs3_surface& s = *surfaces[sidx];
+    const auto& uvPoints = allUVPoints[sidx];
+    auto& points = allPoints[sidx];
+    int i = 0;
+    for (auto& [u, v] : uvPoints) {
+      SPApar_pos uv(u, v);
+      SPAposition pos;
+      bs3_surface_evaluate(uv, s, pos);
+      points[i++].P.SetCoord(pos.x(), pos.y(), pos.z());
+    }
+  }
+}
+
+void evaluateSurfacesDegree1(const std::vector<UniqueACISSurf>& surfaces,
+                             const std::vector<std::vector<std::pair<double, double>>>& allUVPoints,
+                             std::vector<std::vector<SurfaceResult>>& allPoints)
+{
+  for (size_t sidx = 0; sidx < surfaces.size(); ++sidx) {
+    const bs3_surface& s = *surfaces[sidx];
+    const auto& uvPoints = allUVPoints[sidx];
+    auto& points = allPoints[sidx];
+    int i = 0;
+    for (auto& [u, v] : uvPoints) {
+      SPApar_pos uv(u, v);
+      SPAposition pos;
+      SPAvector d1[2];                 // [du, dv]
+      SPAvector* deriv[1] = { d1 };
+      bs3_surface_evaluate(uv, s, pos, deriv, 1);
+      SurfaceResult& r = points[i++];
+      r.P.SetCoord(pos.x(), pos.y(), pos.z());
+      r.D1u.SetCoord(d1[0].x(), d1[0].y(), d1[0].z());
+      r.D1v.SetCoord(d1[1].x(), d1[1].y(), d1[1].z());
+    }
+  }
+}
+
+void evaluateSurfacesDegree2(const std::vector<UniqueACISSurf>& surfaces,
+                             const std::vector<std::vector<std::pair<double, double>>>& allUVPoints,
+                             std::vector<std::vector<SurfaceResult>>& allPoints)
+{
+  for (size_t sidx = 0; sidx < surfaces.size(); ++sidx) {
+    const bs3_surface& s = *surfaces[sidx];
+    const auto& uvPoints = allUVPoints[sidx];
+    auto& points = allPoints[sidx];
+    int i = 0;
+    for (auto& [u, v] : uvPoints) {
+      SPApar_pos uv(u, v);
+      SPAposition pos;
+      SPAvector d1[2];                 // [du, dv]
+      SPAvector d2[3];                 // [duu, duv, dvv]
+      SPAvector* deriv[2] = { d1, d2 };
+      bs3_surface_evaluate(uv, s, pos, deriv, 2);
+      SurfaceResult& r = points[i++];
+      r.P.SetCoord(pos.x(), pos.y(), pos.z());
+      r.D1u.SetCoord(d1[0].x(), d1[0].y(), d1[0].z());
+      r.D1v.SetCoord(d1[1].x(), d1[1].y(), d1[1].z());
+      r.D2uu.SetCoord(d2[0].x(), d2[0].y(), d2[0].z());
+      r.D2uv.SetCoord(d2[1].x(), d2[1].y(), d2[1].z());
+      r.D2vv.SetCoord(d2[2].x(), d2[2].y(), d2[2].z());
+    }
+  }
+}
+
+#endif /* HAS_ACIS */
+
+#ifdef HAS_PARASOLID
+
+// ==================== PARASOLID BACKEND ====================
+//
+// Evaluation strategy: Parasolid evaluates a geometry entity directly through
+// PK_SURF_eval / PK_CURVE_eval; B-surfaces and B-curves cache their active span
+// internally, so this is the direct analogue of OCCT's cached geometric
+// evaluation. Alternatives (see README): evaluating through a FACE
+// (PK_EVAL_face_* / PK_FACE_*), which adds the face transform and sense on top
+// of the surface, and the batched PK_SURF_eval_grid, which evaluates a whole
+// rectangular grid of parameters in one call.
+//
+// A Parasolid session needs a "frustrum" (memory + I/O callbacks). Only memory
+// and start/stop are exercised here; the file callbacks are inert stubs because
+// this benchmark builds entities in memory and never reads or writes Parasolid
+// files. Signatures follow the standard Parasolid frustrum. Requires a valid
+// Parasolid licence/schema at run time.
+
+static int g_parasolidStarts = 0;
+
+static void PS_FSTART(int* ifail) { ++g_parasolidStarts; *ifail = 0; }
+static void PS_FSTOP(int* ifail)  { if (g_parasolidStarts > 0) --g_parasolidStarts; *ifail = 0; }
+static void PS_FMALLO(int* nbytes, char** memory, int* ifail)
+{
+  *memory = static_cast<char*>(malloc(*nbytes));
+  *ifail = (*memory != nullptr) ? 0 : 1;   // 0 == FR_no_errors
+}
+static void PS_FMFREE(int* /*nbytes*/, char** memory, int* ifail) { free(*memory); *ifail = 0; }
+static void PS_FFOPRD(const int*, const int*, const char*, const int*, const int*, int* strid, int* ifail) { *strid = -1; *ifail = 1; }
+static void PS_FFOPWR(const int*, const int*, const char*, const int*, const char*, const int*, int* strid, int* ifail) { *strid = -1; *ifail = 1; }
+static void PS_FFWRIT(const int*, const int*, const int*, const char*, int* ifail) { *ifail = 1; }
+static void PS_FFREAD(const int*, const int*, const int*, char*, int* nactual, int* ifail) { *nactual = 0; *ifail = 1; }
+static void PS_FFCLOS(const int*, const int*, const int*, int* ifail) { *ifail = 1; }
+
+static void ParasolidInitOnce()
+{
+  static bool s_started = false;
+  if (s_started) return;
+
+  PK_SESSION_frustrum_t fru;
+  PK_SESSION_frustrum_o_m(fru);
+  fru.fstart = PS_FSTART;
+  fru.fstop  = PS_FSTOP;
+  fru.fmallo = PS_FMALLO;
+  fru.fmfree = PS_FMFREE;
+  fru.ffoprd = PS_FFOPRD;
+  fru.ffopwr = PS_FFOPWR;
+  fru.ffclos = PS_FFCLOS;
+  fru.ffread = PS_FFREAD;
+  fru.ffwrit = PS_FFWRIT;
+  PK_SESSION_register_frustrum(&fru);
+
+  PK_SESSION_start_o_t opts;
+  PK_SESSION_start_o_m(opts);
+  PK_ERROR_code_t err = PK_SESSION_start(&opts);
+  if (err != PK_ERROR_no_errors) {
+    throw std::runtime_error("Failed to start Parasolid session (error " +
+                             std::to_string(static_cast<int>(err)) +
+                             "); a valid Parasolid licence/schema is required");
+  }
+  s_started = true;
+}
+
+/**
+ * Build a Parasolid b-curve (evaluated as a PK_CURVE_t) from an OCCT B-spline.
+ */
+PK_CURVE_t ConvertToParasolid(const Handle(Geom_BSplineCurve)& curve)
+{
+  ParasolidInitOnce();
+  if (curve.IsNull())
+    throw std::runtime_error("Curve is not a BSpline, not supported by Parasolid backend");
+
+  const int deg = curve->Degree();
+  const int nV  = curve->NbPoles();
+  const bool rational = curve->IsRational();
+
+  // Distinct knots + multiplicities map directly onto the standard form.
+  const int nK = curve->NbKnots();
+  std::vector<double> knot(nK);
+  std::vector<int> mult(nK);
+  for (int i = 1; i <= nK; ++i) { knot[i - 1] = curve->Knot(i); mult[i - 1] = curve->Multiplicity(i); }
+
+  // Rational vertices are homogeneous: (x*w, y*w, z*w, w).
+  const int vdim = rational ? 4 : 3;
+  const TColgp_Array1OfPnt& poles = curve->Poles();
+  const TColStd_Array1OfReal* weights = curve->Weights();
+  std::vector<double> vertex(static_cast<size_t>(nV) * vdim);
+  for (int i = 1; i <= nV; ++i) {
+    const size_t k = static_cast<size_t>(i - 1) * vdim;
+    const gp_Pnt& p = poles(i);
+    const double w = rational ? weights->Value(i) : 1.0;
+    vertex[k + 0] = p.X() * w;
+    vertex[k + 1] = p.Y() * w;
+    vertex[k + 2] = p.Z() * w;
+    if (rational) vertex[k + 3] = w;
+  }
+
+  PK_BCURVE_sf_t sf{};   // advisory enums (form/knot_type/...) left at their unset default
+  sf.degree      = deg;
+  sf.n_vertices  = nV;
+  sf.vertex_dim  = vdim;
+  sf.is_rational = rational ? PK_LOGICAL_true : PK_LOGICAL_false;
+  sf.vertex      = vertex.data();
+  sf.n_knots     = nK;
+  sf.knot_mult   = mult.data();
+  sf.knot        = knot.data();
+
+  PK_BCURVE_t bcurve{};
+  PK_ERROR_code_t err = PK_BCURVE_create(&sf, &bcurve);
+  if (err != PK_ERROR_no_errors)
+    throw std::runtime_error("PK_BCURVE_create failed (error " + std::to_string(static_cast<int>(err)) + ")");
+
+  return static_cast<PK_CURVE_t>(bcurve);   // a b-curve is a curve entity
+}
+
+/**
+ * Build a Parasolid b-surface (evaluated as a PK_SURF_t) from an OCCT B-spline.
+ */
+PK_SURF_t ConvertToParasolid(const Handle(Geom_BSplineSurface)& surf)
+{
+  ParasolidInitOnce();
+  if (surf.IsNull())
+    throw std::runtime_error("Surface is not a BSpline, not supported by Parasolid backend");
+
+  const int uDeg = surf->UDegree();
+  const int vDeg = surf->VDegree();
+  const int nU = surf->NbUPoles();
+  const int nV = surf->NbVPoles();
+  const bool rational = surf->IsURational() || surf->IsVRational();
+
+  const int nUK = surf->NbUKnots();
+  const int nVK = surf->NbVKnots();
+  std::vector<double> uKnot(nUK), vKnot(nVK);
+  std::vector<int> uMult(nUK), vMult(nVK);
+  for (int i = 1; i <= nUK; ++i) { uKnot[i - 1] = surf->UKnot(i); uMult[i - 1] = surf->UMultiplicity(i); }
+  for (int i = 1; i <= nVK; ++i) { vKnot[i - 1] = surf->VKnot(i); vMult[i - 1] = surf->VMultiplicity(i); }
+
+  // Vertices vary most quickly with v, then u; rational vertices are homogeneous.
+  const int vdim = rational ? 4 : 3;
+  const TColgp_Array2OfPnt& poles = surf->Poles();
+  const TColStd_Array2OfReal* weights = surf->Weights();
+  std::vector<double> vertex(static_cast<size_t>(nU) * nV * vdim);
+  for (int i = 1; i <= nU; ++i) {
+    for (int j = 1; j <= nV; ++j) {
+      const size_t k = (static_cast<size_t>(i - 1) * nV + (j - 1)) * vdim;
+      const gp_Pnt& p = poles(i, j);
+      const double w = rational ? weights->Value(i, j) : 1.0;
+      vertex[k + 0] = p.X() * w;
+      vertex[k + 1] = p.Y() * w;
+      vertex[k + 2] = p.Z() * w;
+      if (rational) vertex[k + 3] = w;
+    }
+  }
+
+  PK_BSURF_sf_t sf{};    // advisory enums (form/knot_type/...) left at their unset default
+  sf.u_degree     = uDeg;
+  sf.v_degree     = vDeg;
+  sf.n_u_vertices = nU;
+  sf.n_v_vertices = nV;
+  sf.vertex_dim   = vdim;
+  sf.is_rational  = rational ? PK_LOGICAL_true : PK_LOGICAL_false;
+  sf.vertex       = vertex.data();
+  sf.n_u_knots    = nUK;
+  sf.n_v_knots    = nVK;
+  sf.u_knot_mult  = uMult.data();
+  sf.v_knot_mult  = vMult.data();
+  sf.u_knot       = uKnot.data();
+  sf.v_knot       = vKnot.data();
+
+  PK_BSURF_t bsurf{};
+  PK_ERROR_code_t err = PK_BSURF_create(&sf, &bsurf);
+  if (err != PK_ERROR_no_errors)
+    throw std::runtime_error("PK_BSURF_create failed (error " + std::to_string(static_cast<int>(err)) + ")");
+
+  return static_cast<PK_SURF_t>(bsurf);     // a b-surface is a surface entity
+}
+
+// ---- curve evaluation: p[0]=point, p[1]=1st deriv, p[2]=2nd deriv ----
+void evaluateCurvesDegree0(const std::vector<PK_CURVE_t>& curves,
+                           const std::vector<std::vector<double>>& allParams,
+                           std::vector<std::vector<CurveResult>>& allPoints)
+{
+  for (size_t cidx = 0; cidx < curves.size(); ++cidx) {
+    PK_CURVE_t c = curves[cidx];
+    const auto& params = allParams[cidx];
+    auto& points = allPoints[cidx];
+    int i = 0;
+    for (double t : params) {
+      PK_VECTOR_t p[1];
+      PK_CURVE_eval(c, t, 0, p);
+      points[i++].P.SetCoord(p[0].coord[0], p[0].coord[1], p[0].coord[2]);
+    }
+  }
+}
+
+void evaluateCurvesDegree1(const std::vector<PK_CURVE_t>& curves,
+                           const std::vector<std::vector<double>>& allParams,
+                           std::vector<std::vector<CurveResult>>& allPoints)
+{
+  for (size_t cidx = 0; cidx < curves.size(); ++cidx) {
+    PK_CURVE_t c = curves[cidx];
+    const auto& params = allParams[cidx];
+    auto& points = allPoints[cidx];
+    int i = 0;
+    for (double t : params) {
+      PK_VECTOR_t p[2];
+      PK_CURVE_eval(c, t, 1, p);
+      CurveResult& r = points[i++];
+      r.P.SetCoord(p[0].coord[0], p[0].coord[1], p[0].coord[2]);
+      r.D1.SetCoord(p[1].coord[0], p[1].coord[1], p[1].coord[2]);
+    }
+  }
+}
+
+void evaluateCurvesDegree2(const std::vector<PK_CURVE_t>& curves,
+                           const std::vector<std::vector<double>>& allParams,
+                           std::vector<std::vector<CurveResult>>& allPoints)
+{
+  for (size_t cidx = 0; cidx < curves.size(); ++cidx) {
+    PK_CURVE_t c = curves[cidx];
+    const auto& params = allParams[cidx];
+    auto& points = allPoints[cidx];
+    int i = 0;
+    for (double t : params) {
+      PK_VECTOR_t p[3];
+      PK_CURVE_eval(c, t, 2, p);
+      CurveResult& r = points[i++];
+      r.P.SetCoord(p[0].coord[0], p[0].coord[1], p[0].coord[2]);
+      r.D1.SetCoord(p[1].coord[0], p[1].coord[1], p[1].coord[2]);
+      r.D2.SetCoord(p[2].coord[0], p[2].coord[1], p[2].coord[2]);
+    }
+  }
+}
+
+// ---- surface evaluation ----
+// Rectangular layout: index of (i-th u-deriv, j-th v-deriv) = i + (n_u_derivs+1)*j.
+void evaluateSurfacesDegree0(const std::vector<PK_SURF_t>& surfaces,
+                             const std::vector<std::vector<std::pair<double, double>>>& allUVPoints,
+                             std::vector<std::vector<SurfaceResult>>& allPoints)
+{
+  for (size_t sidx = 0; sidx < surfaces.size(); ++sidx) {
+    PK_SURF_t s = surfaces[sidx];
+    const auto& uvPoints = allUVPoints[sidx];
+    auto& points = allPoints[sidx];
+    int i = 0;
+    for (auto& [u, v] : uvPoints) {
+      PK_UV_t uv; uv.param[0] = u; uv.param[1] = v;
+      PK_VECTOR_t p[1];
+      PK_SURF_eval(s, uv, 0, 0, PK_LOGICAL_false, p);
+      points[i++].P.SetCoord(p[0].coord[0], p[0].coord[1], p[0].coord[2]);
+    }
+  }
+}
+
+void evaluateSurfacesDegree1(const std::vector<PK_SURF_t>& surfaces,
+                             const std::vector<std::vector<std::pair<double, double>>>& allUVPoints,
+                             std::vector<std::vector<SurfaceResult>>& allPoints)
+{
+  for (size_t sidx = 0; sidx < surfaces.size(); ++sidx) {
+    PK_SURF_t s = surfaces[sidx];
+    const auto& uvPoints = allUVPoints[sidx];
+    auto& points = allPoints[sidx];
+    int i = 0;
+    for (auto& [u, v] : uvPoints) {
+      PK_UV_t uv; uv.param[0] = u; uv.param[1] = v;
+      PK_VECTOR_t p[4];   // (1+1)*(1+1)
+      PK_SURF_eval(s, uv, 1, 1, PK_LOGICAL_false, p);
+      SurfaceResult& r = points[i++];
+      r.P.SetCoord(p[0].coord[0], p[0].coord[1], p[0].coord[2]);
+      r.D1u.SetCoord(p[1].coord[0], p[1].coord[1], p[1].coord[2]);   // i=1,j=0
+      r.D1v.SetCoord(p[2].coord[0], p[2].coord[1], p[2].coord[2]);   // i=0,j=1
+    }
+  }
+}
+
+void evaluateSurfacesDegree2(const std::vector<PK_SURF_t>& surfaces,
+                             const std::vector<std::vector<std::pair<double, double>>>& allUVPoints,
+                             std::vector<std::vector<SurfaceResult>>& allPoints)
+{
+  for (size_t sidx = 0; sidx < surfaces.size(); ++sidx) {
+    PK_SURF_t s = surfaces[sidx];
+    const auto& uvPoints = allUVPoints[sidx];
+    auto& points = allPoints[sidx];
+    int i = 0;
+    for (auto& [u, v] : uvPoints) {
+      PK_UV_t uv; uv.param[0] = u; uv.param[1] = v;
+      PK_VECTOR_t p[9];   // (2+1)*(2+1)
+      PK_SURF_eval(s, uv, 2, 2, PK_LOGICAL_false, p);
+      SurfaceResult& r = points[i++];
+      r.P.SetCoord(p[0].coord[0], p[0].coord[1], p[0].coord[2]);     // point
+      r.D1u.SetCoord(p[1].coord[0], p[1].coord[1], p[1].coord[2]);   // i=1,j=0
+      r.D2uu.SetCoord(p[2].coord[0], p[2].coord[1], p[2].coord[2]);  // i=2,j=0
+      r.D1v.SetCoord(p[3].coord[0], p[3].coord[1], p[3].coord[2]);   // i=0,j=1
+      r.D2uv.SetCoord(p[4].coord[0], p[4].coord[1], p[4].coord[2]);  // i=1,j=1
+      r.D2vv.SetCoord(p[6].coord[0], p[6].coord[1], p[6].coord[2]);  // i=0,j=2
+    }
+  }
+}
+
+#endif /* HAS_PARASOLID */
+
 /**
  * Dump surface evaluation results
  */
@@ -942,7 +1522,8 @@ PerfResult benchmarkCurves(const TopoDS_Shape& shape,
                            int numRepeats,
                            bool randomMode,
                            int derivDegree,
-                           bool recordOutput)
+                           bool recordOutput,
+                           Library lib)
 {
   // Collect all edges from the shape
   std::vector<TopoDS_Edge> edges;
@@ -985,18 +1566,73 @@ PerfResult benchmarkCurves(const TopoDS_Shape& shape,
     allPoints.emplace_back(allParams.back().size());
   }
 
-  // Select and execute the appropriate evaluation function based on mode and degree
+  // Select and execute the appropriate evaluation function based on selected library, mode, and degree
   PerfResult result{};
-  switch (derivDegree) {
-  case 0:
-    result = measureTime([&]() {evaluateCurvesDegree0(curves, allParams, allPoints); }, numRepeats);
-    break;
-  case 1:
-    result = measureTime([&]() {evaluateCurvesDegree1(curves, allParams, allPoints); }, numRepeats);
-    break;
-  case 2:
-    result = measureTime([&]() {evaluateCurvesDegree2(curves, allParams, allPoints); }, numRepeats);
-    break;
+  if (lib == Library::OCCT)
+  {
+    switch (derivDegree) {
+    case 0:
+      result = measureTime([&]() {evaluateCurvesDegree0(curves, allParams, allPoints); }, numRepeats);
+      break;
+    case 1:
+      result = measureTime([&]() {evaluateCurvesDegree1(curves, allParams, allPoints); }, numRepeats);
+      break;
+    case 2:
+      result = measureTime([&]() {evaluateCurvesDegree2(curves, allParams, allPoints); }, numRepeats);
+      break;
+    }
+  }
+  else if (lib == Library::ACIS)
+  {
+#ifdef HAS_ACIS
+    std::vector<UniqueACISCurve> curvesAcis;
+    curvesAcis.reserve(curves.size());
+    for (size_t i = 0; i < curves.size(); ++i) {
+      curvesAcis.emplace_back(std::move(ConvertToACIS(curves[i].BSpline())));
+    }
+
+    switch (derivDegree) {
+    case 0:
+      result = measureTime([&]() {evaluateCurvesDegree0(curvesAcis, allParams, allPoints); }, numRepeats);
+      break;
+    case 1:
+      result = measureTime([&]() {evaluateCurvesDegree1(curvesAcis, allParams, allPoints); }, numRepeats);
+      break;
+    case 2:
+      result = measureTime([&]() {evaluateCurvesDegree2(curvesAcis, allParams, allPoints); }, numRepeats);
+      break;
+    }
+#else
+    throw std::runtime_error("The executable is built without ACIS support");
+#endif
+  }
+  else if (lib == Library::Parasolid)
+  {
+#ifdef HAS_PARASOLID
+    std::vector<PK_CURVE_t> curvesPs;
+    curvesPs.reserve(curves.size());
+    for (size_t i = 0; i < curves.size(); ++i) {
+      curvesPs.push_back(ConvertToParasolid(curves[i].BSpline()));
+    }
+
+    switch (derivDegree) {
+    case 0:
+      result = measureTime([&]() {evaluateCurvesDegree0(curvesPs, allParams, allPoints); }, numRepeats);
+      break;
+    case 1:
+      result = measureTime([&]() {evaluateCurvesDegree1(curvesPs, allParams, allPoints); }, numRepeats);
+      break;
+    case 2:
+      result = measureTime([&]() {evaluateCurvesDegree2(curvesPs, allParams, allPoints); }, numRepeats);
+      break;
+    }
+#else
+    throw std::runtime_error("The executable is built without Parasolid support");
+#endif
+  }
+  else
+  {
+    throw std::runtime_error("The selected library does not support curve evaluation");
   }
 
   // Output either summary of curve propeties or all points evaluated
@@ -1168,6 +1804,54 @@ PerfResult benchmarkSurfaces(const TopoDS_Shape& shape,
     throw std::runtime_error("The executable is built without SISL support");
 #endif
   }
+  else if (lib == Library::ACIS)
+  {
+#ifdef HAS_ACIS
+    std::vector<UniqueACISSurf> surfacesAcis;
+    surfacesAcis.reserve(surfaces.size());
+    for (size_t i = 0; i < surfaces.size(); ++i) {
+      surfacesAcis.emplace_back(std::move(ConvertToACIS(surfaces[i].BSpline())));
+    }
+
+    switch (derivDegree) {
+    case 0:
+      result = measureTime([&]() {evaluateSurfacesDegree0(surfacesAcis, allUVPoints, allPoints); }, numRepeats);
+      break;
+    case 1:
+      result = measureTime([&]() {evaluateSurfacesDegree1(surfacesAcis, allUVPoints, allPoints); }, numRepeats);
+      break;
+    case 2:
+      result = measureTime([&]() {evaluateSurfacesDegree2(surfacesAcis, allUVPoints, allPoints); }, numRepeats);
+      break;
+    }
+#else
+    throw std::runtime_error("The executable is built without ACIS support");
+#endif
+  }
+  else if (lib == Library::Parasolid)
+  {
+#ifdef HAS_PARASOLID
+    std::vector<PK_SURF_t> surfacesPs;
+    surfacesPs.reserve(surfaces.size());
+    for (size_t i = 0; i < surfaces.size(); ++i) {
+      surfacesPs.push_back(ConvertToParasolid(surfaces[i].BSpline()));
+    }
+
+    switch (derivDegree) {
+    case 0:
+      result = measureTime([&]() {evaluateSurfacesDegree0(surfacesPs, allUVPoints, allPoints); }, numRepeats);
+      break;
+    case 1:
+      result = measureTime([&]() {evaluateSurfacesDegree1(surfacesPs, allUVPoints, allPoints); }, numRepeats);
+      break;
+    case 2:
+      result = measureTime([&]() {evaluateSurfacesDegree2(surfacesPs, allUVPoints, allPoints); }, numRepeats);
+      break;
+    }
+#else
+    throw std::runtime_error("The executable is built without Parasolid support");
+#endif
+  }
 
   // For special case of 4 sequential points, which may be located exactly at
   // the corners of the surface (if face is built on natural range of the surface),
@@ -1330,6 +2014,12 @@ int main(int argc, char* argv[])
       else if (libStr == "sisl") {
         lib = Library::SISL;
       }
+      else if (libStr == "acis") {
+        lib = Library::ACIS;
+      }
+      else if (libStr == "parasolid") {
+        lib = Library::Parasolid;
+      }
       else if (libStr != "occt") {
         throw std::runtime_error("Unsupported library type: '" + libStr + "'");
       }
@@ -1416,7 +2106,7 @@ int main(int argc, char* argv[])
         std::cout << indices[i];
       }
       std::cout << ")" << std::endl << std::endl;
-      result = benchmarkCurves(shape, indices, numPoints, numRepeats, isRandom, derivDegree, recordOutput);
+      result = benchmarkCurves(shape, indices, numPoints, numRepeats, isRandom, derivDegree, recordOutput, lib);
     }
     else {
       std::cout << "Benchmarking surfaces (faces: ";
