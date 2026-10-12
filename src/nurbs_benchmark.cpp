@@ -38,6 +38,7 @@
 #include <TopoDS_Shape.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
 
 // If TinyNurbs library is available (in submodules), use it
 #if __has_include(<tinynurbs/tinynurbs.h>)
@@ -123,16 +124,17 @@ double GetProcessCPU()
   */
 void printUsage(const char* progName)
 {
-  std::cout << "Usage: " << progName << " <file> <curves|surfaces> <indices> <numPoints> <numRepeats> <random|sequential> <derivDegree(0-2)> <perf|record> [lib]\n";
+  std::cout << "Usage: " << progName << " <file> <curves|surfaces> <indices> <numPoints> <numRepeats> <random|sequential> <derivDegree(0-2)> <perf|record|probe> [lib]\n";
   std::cout << "  <file>        - Path to .brep or .step file\n";
   std::cout << "  <curves|surfaces> - Choose to evaluate curves or surfaces\n";
   std::cout << "  <indices>     - Comma-separated list of edge (for curves) or face (for surfaces) indices (1-based),\n";
-  std::cout << "                  can include ranges like 3-7\n";
+  std::cout << "                  can include ranges like 3-7, or '*' for all subshapes (probe mode only)\n";
   std::cout << "  <numPoints>   - Number of points to evaluate\n";
   std::cout << "  <numRepeats>  - Number of times to repeat evaluation (for greater times)\n";
   std::cout << "  <random|sequential> - Parameter distribution mode\n";
   std::cout << "  <derivDegree> - Derivative degree (0, 1, or 2)\n";
-  std::cout << "  <perf|record> - Output mode: performance measurement or result recording\n";
+  std::cout << "  <perf|record|probe> - Output mode: performance measurement, result recording,\n";
+  std::cout << "                  or geometry probe (report type/BSpline properties of every subshape, no evaluation)\n";
   std::cout << "  lib           - Librray to be used: occt (default) or tinynurbs\n";
   std::cout << "\nExample: " << progName << " model.step curves 1,2,3 10000 10 random 1 perf\n";
 }
@@ -1237,6 +1239,66 @@ static std::string GetCurrentTimeString()
 };
 
 /**
+ * Probe mode: report the geometry of every subshape of the requested kind,
+ * without performing any evaluation.
+ *
+ * Subshapes are deduplicated (orientation-normalized) so that a shared edge or
+ * face is reported once per model. For BSpline geometry the intrinsic
+ * properties are printed; for other geometry only the type name is printed.
+ * Output lines are prefixed with "PROBE" for easy machine parsing:
+ *   PROBE C <index> BSpline <degree> <rational 0/1> <nbKnots>
+ *   PROBE C <index> <CurveTypeName>
+ *   PROBE S <index> BSpline <uDeg> <vDeg> <ratU 0/1> <ratV 0/1> <nbUKnots> <nbVKnots>
+ *   PROBE S <index> <SurfaceTypeName>
+ */
+static void probeShape(const TopoDS_Shape& shape, bool curves)
+{
+  TopTools_IndexedMapOfShape subshapes;
+  const TopAbs_ShapeEnum kind = curves ? TopAbs_EDGE : TopAbs_FACE;
+  for (TopExp_Explorer exp(shape, kind); exp.More(); exp.Next()) {
+    TopoDS_Shape s = exp.Current();
+    s.Orientation(TopAbs_FORWARD); // normalize so shared subshapes are counted once
+    subshapes.Add(s);
+  }
+
+  static const std::array<const char*, 9> curveTypeNames = {
+    "Line", "Circle", "Ellipse", "Hyperbola", "Parabola", "BezierCurve", "BSplineCurve", "OffsetCurve", "OtherCurve"
+  };
+  static const std::array<const char*, 11> surfTypeNames = {
+    "Plane", "Cylinder", "Cone", "Sphere", "Torus", "BezierSurface", "BSplineSurface", "SurfaceOfRevolution", "SurfaceOfExtrusion", "OffsetSurface", "OtherSurface"
+  };
+
+  for (int i = 1; i <= subshapes.Extent(); ++i) {
+    const TopoDS_Shape& s = subshapes(i);
+    if (curves) {
+      BRepAdaptor_Curve c(TopoDS::Edge(s));
+      const GeomAbs_CurveType t = c.GetType();
+      if (t == GeomAbs_BSplineCurve) {
+        const Handle(Geom_BSplineCurve) b = c.BSpline();
+        std::cout << "PROBE C " << i << " BSpline " << b->Degree() << " "
+                  << (b->IsRational() ? 1 : 0) << " " << b->NbKnots() << "\n";
+      }
+      else {
+        std::cout << "PROBE C " << i << " " << curveTypeNames[t - GeomAbs_Line] << "\n";
+      }
+    }
+    else {
+      BRepAdaptor_Surface sf(TopoDS::Face(s), false);
+      const GeomAbs_SurfaceType t = sf.GetType();
+      if (t == GeomAbs_BSplineSurface) {
+        const Handle(Geom_BSplineSurface) b = sf.BSpline();
+        std::cout << "PROBE S " << i << " BSpline " << b->UDegree() << " " << b->VDegree() << " "
+                  << (b->IsURational() ? 1 : 0) << " " << (b->IsVRational() ? 1 : 0) << " "
+                  << b->NbUKnots() << " " << b->NbVKnots() << "\n";
+      }
+      else {
+        std::cout << "PROBE S " << i << " " << surfTypeNames[t - GeomAbs_Plane] << "\n";
+      }
+    }
+  }
+}
+
+/**
  * Main entry point
  */
 int main(int argc, char* argv[])
@@ -1305,19 +1367,30 @@ int main(int argc, char* argv[])
     }
 
     bool recordOutput = false;
+    bool probeMode = false;
     if (outputStr == "record") {
       recordOutput = true;
     }
     else if (outputStr == "perf") {
     }
+    else if (outputStr == "probe") {
+      probeMode = true;
+    }
     else {
-      throw std::runtime_error("Output mode must be 'perf' or 'record'");
+      throw std::runtime_error("Output mode must be 'perf', 'record' or 'probe'");
     }
 
-    // Parse indices
-    std::vector<int> indices = parseIndices(indicesStr);
-    if (indices.empty()) {
-      throw std::runtime_error("No indices provided");
+    // Parse indices (probe mode scans all subshapes, so indices are ignored there)
+    std::vector<int> indices;
+    const bool allShapes = (indicesStr == "*");
+    if (!probeMode) {
+      if (allShapes) {
+        throw std::runtime_error("Index '*' (all subshapes) is only supported in 'probe' output mode");
+      }
+      indices = parseIndices(indicesStr);
+      if (indices.empty()) {
+        throw std::runtime_error("No indices provided");
+      }
     }
 
     // Print timestamp
@@ -1327,6 +1400,12 @@ int main(int argc, char* argv[])
     std::cout << "Loading shape from: " << filePath << std::endl;
     TopoDS_Shape shape = loadShape(filePath);
     std::cout << "Shape loaded successfully" << std::endl;
+
+    // Probe mode: report geometry of every subshape and exit (no evaluation)
+    if (probeMode) {
+      probeShape(shape, isCurves);
+      return 0;
+    }
 
     // Run benchmark
     PerfResult result;
